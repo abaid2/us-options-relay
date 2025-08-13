@@ -56,15 +56,22 @@ def fetch_earnings(from_date, to_date):
 
 
 def fetch_macro(from_date, to_date):
-    j = http_get_json("https://finnhub.io/api/v1/calendar/economic",
-                      params={"from":from_date,"to":to_date,"token":FINNHUB_TOKEN})
+    # Finnhub free plans may 403 this endpoint. Fail-open to [] so the relay keeps working.
+    try:
+        j = http_get_json(
+            "https://finnhub.io/api/v1/calendar/economic",
+            params={"from": from_date, "to": to_date, "token": FINNHUB_TOKEN}
+        )
+        arr = (j.get("economicCalendar") or [])
+    except Exception:
+        arr = []  # no macro events (scanner will treat as no-macro-day)
     out = []
-    for x in (j.get("economicCalendar") or []):
+    for x in arr:
         name = (x.get("event") or "").upper()
         if any(k in name for k in ["CPI","PCE","NFP","PAYROLL","FOMC","FED","JOBS"]):
             ts = x.get("time") or x.get("datetime") or (x.get("date")+"T13:30:00Z" if x.get("date") else None)
             if ts:
-                out.append({"event":name,"utc_time":dt.datetime.fromisoformat(ts.replace("Z","+00:00")).replace(microsecond=0).isoformat()})
+                out.append({"event": name, "utc_time": dt.datetime.fromisoformat(ts.replace("Z","+00:00")).replace(microsecond=0).isoformat()})
     return out
 
 # Tradier market
