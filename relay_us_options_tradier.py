@@ -7,6 +7,7 @@ import os, time, json
 import datetime as dt
 from datetime import timedelta, timezone
 import requests
+import urllib.parse
 
 TRADIER_TOKEN = os.environ.get("TRADIER_TOKEN")
 TRADIER_BASE  = os.environ.get("TRADIER_BASE", "https://api.tradier.com/v1")
@@ -114,35 +115,73 @@ def chains(sym, exp):
     return [opts] if isinstance(opts,dict) else opts
 
 
-def quotes_options(symbols):
+# Keep each GET well under common proxy limits and auto-fallback on gateway errors.
+MAX_URL_LEN = 1500  # conservative safety limit for the full URL
+
+def quotes_options(symbols, max_url_len: int = MAX_URL_LEN, min_chunk: int = 1):
+    """
+    Fetch option quotes (with greeks) from Tradier for a list of OCC symbols.
+    - De-dupes symbols (order-preserving).
+    - Packs as many as will fit under max_url_len.
+    - If a chunk still fails with a 404/414 (gateway choking on length), retries per-symbol.
+    Returns a flat list of Tradier quote rows.
+    """
     out = []
     if not symbols:
         return out
 
-    # Keep query URL comfortably < 1800 chars.
-    # OCC symbols ~20–24 chars each, plus commas; 40 is safe.
-    chunk_size = 40
+    # De-duplicate while preserving order
+    seen = set()
+    syms = [s for s in symbols if not (s in seen or seen.add(s))]
 
     i = 0
-    while i < len(symbols):
-        chunk_syms = symbols[i:i+chunk_size]
-        chunk = ",".join(chunk_syms)
+    while i < len(syms):
+        # Build the largest chunk whose encoded URL stays under max_url_len
+        chunk = []
+        while i < len(syms):
+            test = ",".join(chunk + [syms[i]])
+            query = urllib.parse.urlencode({"symbols": test, "greeks": "true"})
+            url_len = len(f"{TRADIER_BASE}/markets/options/quotes?{query}")
+
+            # If adding this symbol would overflow the limit, stop growing the chunk
+            if url_len > max_url_len:
+                # If even one symbol pushes us over and chunk is empty, force single
+                if not chunk:
+                    chunk = [syms[i]]
+                    i += 1
+                break
+
+            chunk.append(syms[i])
+            i += 1
+
         try:
-            j = http_get_json(f"{TRADIER_BASE}/markets/options/quotes",
-                              headers=HDR_TR, params={"symbols": chunk, "greeks": "true"})
+            j = http_get_json(
+                f"{TRADIER_BASE}/markets/options/quotes",
+                headers=HDR_TR,
+                params={"symbols": ",".join(chunk), "greeks": "true"},
+            )
             qs = (j.get("quotes") or {}).get("quote") or []
             if isinstance(qs, dict):
                 qs = [qs]
             out.extend(qs)
-            i += chunk_size
+
         except requests.HTTPError as e:
-            # If we got 404/414 on this chunk, try again with smaller chunks.
-            if e.response is not None and e.response.status_code in (404, 414):
-                if chunk_size <= 10:
-                    raise  # already as small as we go; re-raise
-                chunk_size = max(10, chunk_size // 2)
-                continue
-            raise
+            code = getattr(e.response, "status_code", None)
+            # Some gateways return 404/414 for overlong URLs; retry one-by-one
+            if code in (404, 414):
+                for s in chunk:
+                    j = http_get_json(
+                        f"{TRADIER_BASE}/markets/options/quotes",
+                        headers=HDR_TR,
+                        params={"symbols": s, "greeks": "true"},
+                    )
+                    qs = (j.get("quotes") or {}).get("quote") or []
+                    if isinstance(qs, dict):
+                        qs = [qs]
+                    out.extend(qs)
+            else:
+                raise
+
     return out
 
 
