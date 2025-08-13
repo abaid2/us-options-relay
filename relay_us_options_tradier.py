@@ -115,13 +115,34 @@ def chains(sym, exp):
 
 
 def quotes_options(symbols):
-    out=[];
-    if not symbols: return out
-    for i in range(0,len(symbols),120):
-        chunk=",".join(symbols[i:i+120])
-        j=http_get_json(f"{TRADIER_BASE}/markets/options/quotes", headers=HDR_TR, params={"symbols":chunk,"greeks":"true"})
-        qs=(j.get("quotes") or {}).get("quote") or []
-        out.extend([qs] if isinstance(qs,dict) else qs)
+    out = []
+    if not symbols:
+        return out
+
+    # Keep query URL comfortably < 1800 chars.
+    # OCC symbols ~20–24 chars each, plus commas; 40 is safe.
+    chunk_size = 40
+
+    i = 0
+    while i < len(symbols):
+        chunk_syms = symbols[i:i+chunk_size]
+        chunk = ",".join(chunk_syms)
+        try:
+            j = http_get_json(f"{TRADIER_BASE}/markets/options/quotes",
+                              headers=HDR_TR, params={"symbols": chunk, "greeks": "true"})
+            qs = (j.get("quotes") or {}).get("quote") or []
+            if isinstance(qs, dict):
+                qs = [qs]
+            out.extend(qs)
+            i += chunk_size
+        except requests.HTTPError as e:
+            # If we got 404/414 on this chunk, try again with smaller chunks.
+            if e.response is not None and e.response.status_code in (404, 414):
+                if chunk_size <= 10:
+                    raise  # already as small as we go; re-raise
+                chunk_size = max(10, chunk_size // 2)
+                continue
+            raise
     return out
 
 
