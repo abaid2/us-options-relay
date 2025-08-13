@@ -14,6 +14,39 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install requests
+
+      # --- DEBUG: show which secrets are present (prints SET/MISSING, never values)
+      - name: Debug secrets presence
+        env:
+          TRADIER_TOKEN: ${{ secrets.TRADIER_TOKEN }}
+          FINNHUB_TOKEN: ${{ secrets.FINNHUB_TOKEN }}
+          GIST_TOKEN:    ${{ secrets.GIST_TOKEN }}
+          GIST_ID_CALENDAR: ${{ secrets.GIST_ID_CALENDAR }}
+          GIST_ID_MARKET:   ${{ secrets.GIST_ID_MARKET }}
+        run: |
+          for k in TRADIER_TOKEN FINNHUB_TOKEN GIST_TOKEN GIST_ID_CALENDAR GIST_ID_MARKET; do
+            if [ -z "${!k}" ]; then
+              echo "::error title=$k missing::$k is NOT set"
+            else
+              echo "$k=SET"
+            fi
+          done
+
+      # --- PREFLIGHT: patch calendar.json once to confirm GIST_TOKEN works
+      - name: Preflight patch calendar.json
+        env:
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID_CALENDAR: ${{ secrets.GIST_ID_CALENDAR }}
+        run: |
+          TS=$(date -u +%FT%TZ)
+          echo "{\"files\":{\"calendar.json\":{\"content\":\"{\\\"meta\\\":{\\\"source\\\":\\\"preflight\\\",\\\"updated_utc\\\":\\\"$TS\\\"}}\"}}}" > patch.json
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer $GIST_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -d @patch.json \
+            "https://api.github.com/gists/$GIST_ID_CALENDAR" | head -c 1000
+
+      # --- RUN THE RELAY
       - name: Run relay
         env:
           TRADIER_TOKEN: ${{ secrets.TRADIER_TOKEN }}
