@@ -6,8 +6,10 @@
 import os, time, json
 import datetime as dt
 from datetime import timedelta, timezone
-import requests
 import urllib.parse
+import requests
+import re
+
 
 TRADIER_TOKEN = os.environ.get("TRADIER_TOKEN")
 TRADIER_BASE  = os.environ.get("TRADIER_BASE", "https://api.tradier.com/v1")
@@ -118,69 +120,87 @@ def chains(sym, exp):
 # Keep each GET well under common proxy limits and auto-fallback on gateway errors.
 MAX_URL_LEN = 1500  # conservative safety limit for the full URL
 
-def quotes_options(symbols, max_url_len: int = MAX_URL_LEN, min_chunk: int = 1):
+# OCC option symbol: UNDERLYING(1-6) + YYMMDD(6) + [C/P] + STRIKE(8)
+_OCC_RE = re.compile(r'^[A-Z.]{1,6}\d{6}[CP]\d{8}$')
+_MAX_URL = 1500  # conservative full-URL length cap
+
+def _is_valid_occ(sym: str) -> bool:
+    return bool(sym) and bool(_OCC_RE.match(sym))
+
+def _fetch_quotes_chunk(chunk_syms):
+    """Fetch one chunk; return list of quote rows. Raise on non-length-related HTTP errors."""
+    params = {"symbols": ",".join(chunk_syms), "greeks": "true"}
+    j = http_get_json(f"{TRADIER_BASE}/markets/options/quotes", headers=HDR_TR, params=params)
+    rows = (j.get("quotes") or {}).get("quote") or []
+    return [rows] if isinstance(rows, dict) else rows
+
+def quotes_options(symbols):
     """
-    Fetch option quotes (with greeks) from Tradier for a list of OCC symbols.
-    - De-dupes symbols (order-preserving).
-    - Packs as many as will fit under max_url_len.
-    - If a chunk still fails with a 404/414 (gateway choking on length), retries per-symbol.
-    Returns a flat list of Tradier quote rows.
+    Robust Tradier options quotes:
+      - order-preserving de-dup
+      - OCC validation
+      - chunk by URL length
+      - binary split on 404/414, skip bad singletons
     """
     out = []
     if not symbols:
         return out
 
-    # De-duplicate while preserving order
+    # 1) de-dup & validate OCC
     seen = set()
-    syms = [s for s in symbols if not (s in seen or seen.add(s))]
+    syms = []
+    for s in symbols:
+        if s and s not in seen:
+            seen.add(s)
+            if _is_valid_occ(s):
+                syms.append(s)
+            # silently drop invalid OCC symbols
+
+    if not syms:
+        return out
 
     i = 0
     while i < len(syms):
-        # Build the largest chunk whose encoded URL stays under max_url_len
+        # 2) build biggest chunk that keeps URL under cap
         chunk = []
         while i < len(syms):
             test = ",".join(chunk + [syms[i]])
-            query = urllib.parse.urlencode({"symbols": test, "greeks": "true"})
-            url_len = len(f"{TRADIER_BASE}/markets/options/quotes?{query}")
-
-            # If adding this symbol would overflow the limit, stop growing the chunk
-            if url_len > max_url_len:
-                # If even one symbol pushes us over and chunk is empty, force single
+            q = urllib.parse.urlencode({"symbols": test, "greeks": "true"})
+            url_len = len(f"{TRADIER_BASE}/markets/options/quotes?{q}")
+            if url_len > _MAX_URL:
                 if not chunk:
-                    chunk = [syms[i]]
+                    chunk = [syms[i]]  # force single
                     i += 1
                 break
-
             chunk.append(syms[i])
             i += 1
 
+        # 3) try the chunk; on gateway length issues, binary-split; on single 404/414, skip
         try:
-            j = http_get_json(
-                f"{TRADIER_BASE}/markets/options/quotes",
-                headers=HDR_TR,
-                params={"symbols": ",".join(chunk), "greeks": "true"},
-            )
-            qs = (j.get("quotes") or {}).get("quote") or []
-            if isinstance(qs, dict):
-                qs = [qs]
-            out.extend(qs)
-
+            out.extend(_fetch_quotes_chunk(chunk))
         except requests.HTTPError as e:
             code = getattr(e.response, "status_code", None)
-            # Some gateways return 404/414 for overlong URLs; retry one-by-one
             if code in (404, 414):
-                for s in chunk:
-                    j = http_get_json(
-                        f"{TRADIER_BASE}/markets/options/quotes",
-                        headers=HDR_TR,
-                        params={"symbols": s, "greeks": "true"},
-                    )
-                    qs = (j.get("quotes") or {}).get("quote") or []
-                    if isinstance(qs, dict):
-                        qs = [qs]
-                    out.extend(qs)
-            else:
-                raise
+                # binary split until singles
+                stack = [chunk]
+                while stack:
+                    part = stack.pop()
+                    if len(part) == 1:
+                        try:
+                            out.extend(_fetch_quotes_chunk(part))
+                        except requests.HTTPError as e2:
+                            code2 = getattr(e2.response, "status_code", None)
+                            if code2 in (404, 414, 400):
+                                # skip this bad symbol; continue
+                                continue
+                            raise
+                    else:
+                        mid = len(part) // 2
+                        stack.append(part[:mid])
+                        stack.append(part[mid:])
+                continue
+            # any other HTTP error: re-raise (real auth/network issue)
+            raise
 
     return out
 
