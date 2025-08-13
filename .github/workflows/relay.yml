@@ -1,4 +1,4 @@
-name: Relay (Tradier → Gists)
+name: Relay (Tradier to Gists)
 
 on:
   schedule:
@@ -22,10 +22,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - run: pip install requests
+      - name: Install deps
+        run: pip install requests
 
-      # --- DEBUG: verify required secrets are present (never prints secret values)
-      - name: Debug secrets presence
+      - name: Check required secrets
         env:
           TRADIER_TOKEN:    ${{ secrets.TRADIER_TOKEN }}
           FINNHUB_TOKEN:    ${{ secrets.FINNHUB_TOKEN }}
@@ -33,7 +33,9 @@ jobs:
           GIST_ID_CALENDAR: ${{ secrets.GIST_ID_CALENDAR }}
           GIST_ID_MARKET:   ${{ secrets.GIST_ID_MARKET }}
           GIST_ID_HISTORY:  ${{ secrets.GIST_ID_HISTORY }}
+        shell: bash
         run: |
+          set -e
           missing=0
           for k in TRADIER_TOKEN FINNHUB_TOKEN GIST_TOKEN GIST_ID_CALENDAR GIST_ID_MARKET GIST_ID_HISTORY; do
             if [ -z "${!k}" ]; then
@@ -43,74 +45,52 @@ jobs:
               echo "$k=SET"
             fi
           done
-          if [ "$missing" -ne 0 ]; then
-            echo "One or more required secrets are missing."
-            exit 1
-          fi
+          [ "$missing" -eq 0 ]
 
-      # --- PREFLIGHT: patch calendar.json (proves GIST_TOKEN works & file exists)
-      - name: Preflight patch calendar.json
-        env:
-          GIST_TOKEN:       ${{ secrets.GIST_TOKEN }}
-          GIST_ID_CALENDAR: ${{ secrets.GIST_ID_CALENDAR }}
-        run: |
-          TS=$(date -u +%FT%TZ)
-          echo "{\"files\":{\"calendar.json\":{\"content\":\"{\\\"meta\\\":{\\\"source\\\":\\\"preflight\\\",\\\"updated_utc\\\":\\\"$TS\\\"}}\"}}}" > patch.json
-          curl -sS -X PATCH \
-            -H "Authorization: Bearer $GIST_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -d @patch.json \
-            "https://api.github.com/gists/$GIST_ID_CALENDAR" | head -c 1000
-
-      # --- PREFLIGHT: ensure history.json exists and is writable
-      - name: Preflight patch history.json
-        env:
-          GIST_TOKEN:      ${{ secrets.GIST_TOKEN }}
-          GIST_ID_HISTORY: ${{ secrets.GIST_ID_HISTORY }}
-        run: |
-          TS=$(date -u +%FT%TZ)
-          echo "{\"files\":{\"history.json\":{\"content\":\"{\\\"meta\\\":{\\\"source\\\":\\\"preflight\\\",\\\"updated_utc\\\":\\\"$TS\\\"},\\\"symbols\\\":{}}\"}}}" > patch_hist.json
-          curl -sS -X PATCH \
-            -H "Authorization: Bearer $GIST_TOKEN" \
-            -H "Accept: application/vnd.github+json" \
-            -d @patch_hist.json \
-            "https://api.github.com/gists/$GIST_ID_HISTORY" | head -c 1000
-
-      # --- SKIP IF FRESH: avoid redundant heavy run when feeds are fresh enough
-      - name: Skip if fresh (≤4m market, ≤10m calendar)
+      # Freshness gate to avoid redundant runs; exposes outputs for the next step
+      - name: Check freshness
+        id: freshness
         env:
           GIST_TOKEN:       ${{ secrets.GIST_TOKEN }}
           GIST_ID_CALENDAR: ${{ secrets.GIST_ID_CALENDAR }}
           GIST_ID_MARKET:   ${{ secrets.GIST_ID_MARKET }}
+        shell: bash
         run: |
-          fetch_ts () {
-            curl -sS -H "Authorization: Bearer $GIST_TOKEN" "https://api.github.com/gists/$1" \
-            | python - "$2" <<'PY'
-import sys, json
-doc=json.load(sys.stdin)
-name=sys.argv[1]
-print(json.loads(doc["files"][name]["content"])["meta"]["updated_utc"] if name in doc["files"] else "")
-PY
-          }
-          to_epoch () { date -u -d "$1" +%s 2>/dev/null || echo 0; }
+          set -e
+          python - <<'PY'
+          import os, json, urllib.request, datetime as dt
+          out = os.environ["GITHUB_OUTPUT"]
+          hdr = {"Authorization": f"Bearer {os.environ['GIST_TOKEN']}",
+                 "Accept":"application/vnd.github+json"}
+          def fetch_ts(gist_id, name):
+            try:
+              req = urllib.request.Request(f"https://api.github.com/gists/{gist_id}", headers=hdr)
+              with urllib.request.urlopen(req, timeout=20) as r:
+                j = json.load(r)
+              content = j["files"][name]["content"]
+              return json.loads(content)["meta"]["updated_utc"]
+            except Exception:
+              return ""
+          def to_epoch(s):
+            try:
+              if s.endswith("Z"): s = s[:-1] + "+00:00"
+              return int(dt.datetime.fromisoformat(s).timestamp())
+            except Exception:
+              return 0
+          now = int(dt.datetime.now(dt.timezone.utc).timestamp())
+          cal_ts = fetch_ts(os.environ["GIST_ID_CALENDAR"], "calendar.json")
+          mkt_ts = fetch_ts(os.environ["GIST_ID_MARKET"],   "market.json")
+          cal_age = now - to_epoch(cal_ts)
+          mkt_age = now - to_epoch(mkt_ts)
+          skip = (mkt_age < 240 and cal_age < 600)
+          print(f"calendar age: {cal_age}s")
+          print(f"market   age: {mkt_age}s")
+          with open(out, "a") as f:
+            f.write(f"skip={'true' if skip else 'false'}\n")
+          PY
 
-          now=$(date -u +%s)
-          cal_ts=$(fetch_ts "$GIST_ID_CALENDAR" calendar.json)
-          mkt_ts=$(fetch_ts "$GIST_ID_MARKET"   market.json)
-
-          age_cal=$(( now - $(to_epoch "$cal_ts") ))
-          age_mkt=$(( now - $(to_epoch "$mkt_ts") ))
-
-          echo "calendar age: ${age_cal}s"
-          echo "market   age: ${age_mkt}s"
-
-          if [ "$age_mkt" -lt 240 ] && [ "$age_cal" -lt 600 ]; then
-            echo "Feeds are fresh; skipping run."
-            exit 0
-          fi
-
-      # --- RUN THE RELAY (one-shot update)
       - name: Run relay
+        if: ${{ steps.freshness.outputs.skip != 'true' }}
         env:
           TRADIER_TOKEN:    ${{ secrets.TRADIER_TOKEN }}
           FINNHUB_TOKEN:    ${{ secrets.FINNHUB_TOKEN }}
@@ -119,6 +99,6 @@ PY
           GIST_ID_MARKET:   ${{ secrets.GIST_ID_MARKET }}
           GIST_ID_HISTORY:  ${{ secrets.GIST_ID_HISTORY }}
           TRADIER_BASE: https://api.tradier.com/v1
-          INTERVAL_SEC: "300"   # used only to tag meta.interval_sec in market.json
+          INTERVAL_SEC: "300"
         run: python relay_us_options_tradier.py
 
