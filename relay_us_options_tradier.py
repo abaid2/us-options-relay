@@ -49,7 +49,7 @@ def http_get_json(url, headers=None, params=None, timeout=20):
 
 def gh_put(gist_id, filename, obj):
     url = f"https://api.github.com/gists/{gist_id}"
-    payload = {"files": {filename: {"content": json.dumps(obj, separators=(',',':'))}}}
+    payload = {"files": {filename: {"content": json.dumps(obj, indent=2)}}}  # <-- indent=2
     r = requests.patch(url, headers=HDR_GH, json=payload, timeout=20)
     r.raise_for_status()
 
