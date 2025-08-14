@@ -2,8 +2,7 @@ name: Relay (Tradier to Gists)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"       # minute 0,5,10,...
-    - cron: "2-59/5 * * * *"    # minute 2,7,12,... (offset to reduce jitter)
+    - cron: "*/5 * * * *"   # run every 5 minutes (UTC)
   workflow_dispatch:
 
 concurrency:
@@ -47,7 +46,6 @@ jobs:
           done
           [ "$missing" -eq 0 ]
 
-      # Freshness gate to avoid redundant runs; exposes outputs for the next step
       - name: Check freshness
         id: freshness
         env:
@@ -67,8 +65,7 @@ jobs:
               req = urllib.request.Request(f"https://api.github.com/gists/{gist_id}", headers=hdr)
               with urllib.request.urlopen(req, timeout=20) as r:
                 j = json.load(r)
-              content = j["files"][name]["content"]
-              return json.loads(content)["meta"]["updated_utc"]
+              return json.loads(j["files"][name]["content"])["meta"]["updated_utc"]
             except Exception:
               return ""
           def to_epoch(s):
@@ -82,9 +79,9 @@ jobs:
           mkt_ts = fetch_ts(os.environ["GIST_ID_MARKET"],   "market.json")
           cal_age = now - to_epoch(cal_ts)
           mkt_age = now - to_epoch(mkt_ts)
-          skip = (mkt_age < 240 and cal_age < 600)
           print(f"calendar age: {cal_age}s")
           print(f"market   age: {mkt_age}s")
+          skip = (mkt_age < 240 and cal_age < 600)
           with open(out, "a") as f:
             f.write(f"skip={'true' if skip else 'false'}\n")
           PY
