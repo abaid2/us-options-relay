@@ -1,9 +1,14 @@
-name: Relay (Tradier to Gists — fast)
+name: Relay (Tradier to Gists — smart skip)
 
 on:
   schedule:
     - cron: "*/5 * * * *"   # run every 5 minutes (UTC)
   workflow_dispatch:
+    inputs:
+      force_run:
+        description: "Bypass smart skip and run the relay"
+        required: false
+        default: "false"
 
 concurrency:
   group: relay-only
@@ -46,57 +51,122 @@ jobs:
           done
           [ "$missing" -eq 0 ]
 
-      - name: Skip if feeds are fresh (≤4m market, ≤10m calendar)
+      - name: Skip if feeds are fresh (smart: macro TTL + greeks/quotes/chain coverage + history)
         id: freshness
         env:
-          GIST_TOKEN:       ${{ secrets.GIST_TOKEN }}
-          GIST_ID_CALENDAR: ${{ secrets.GIST_ID_CALENDAR }}
-          GIST_ID_MARKET:   ${{ secrets.GIST_ID_MARKET }}
+          GIST_TOKEN:         ${{ secrets.GIST_TOKEN }}
+          GIST_ID_CALENDAR:   ${{ secrets.GIST_ID_CALENDAR }}
+          GIST_ID_MARKET:     ${{ secrets.GIST_ID_MARKET }}
+          GIST_ID_HISTORY:    ${{ secrets.GIST_ID_HISTORY }}
+          # Tunables (defaults)
+          MACRO_TTL_HOURS:    "12"    # recache macro at most every 12h
+          CAL_MAX_AGE_S:      "600"   # 10 minutes
+          MKT_MAX_AGE_S:      "240"   # 4 minutes
+          HIST_MAX_AGE_H:     "168"   # 7 days
+          GREKS_COVERAGE_MIN: "0.60"  # >=60% of selected legs must have delta
+          QUOTES_COVERAGE_MIN:"0.70"  # >=70% of quotes must have bid/ask/oi/volume
+          MIN_QUOTES:         "8"     # expect at least 8 legs written
+          MIN_CHAIN_SYMBOLS:  "6"     # expect metrics for >=6 symbols
         shell: bash
         run: |
           set -e
           python - <<'PY'
-          import os, json, urllib.request, datetime as dt
-          out_path = os.environ["GITHUB_OUTPUT"]
+          import os, json, urllib.request, datetime as dt, sys
+
           hdr = {"Authorization": f"Bearer {os.environ['GIST_TOKEN']}",
-                 "Accept": "application/vnd.github+json"}
-          def fetch_ts(gist_id, name):
+                 "Accept":"application/vnd.github+json"}
+          def gist_json(gid, fname):
             try:
-              req = urllib.request.Request(f"https://api.github.com/gists/{gist_id}", headers=hdr)
-              with urllib.request.urlopen(req, timeout=20) as r:
+              req = urllib.request.Request(f"https://api.github.com/gists/{gid}", headers=hdr)
+              with urllib.request.urlopen(req, timeout=25) as r:
                 j = json.load(r)
-              return json.loads(j["files"][name]["content"])["meta"]["updated_utc"]
+              return json.loads(j["files"][fname]["content"])
             except Exception:
-              return ""
-          def to_epoch(s):
-            try:
-              if s.endswith("Z"): s = s[:-1] + "+00:00"
-              return int(dt.datetime.fromisoformat(s).timestamp())
-            except Exception:
-              return 0
+              return {}
+
+          def to_epoch(iso):
+            if not iso: return 0
+            if iso.endswith("Z"): iso = iso[:-1] + "+00:00"
+            try: return int(dt.datetime.fromisoformat(iso).timestamp())
+            except Exception: return 0
+
+          # Load current gists
+          cal = gist_json(os.environ["GIST_ID_CALENDAR"], "calendar.json")
+          mkt = gist_json(os.environ["GIST_ID_MARKET"],    "market.json")
+          hist= gist_json(os.environ["GIST_ID_HISTORY"],   "history.json")
+
           now = int(dt.datetime.now(dt.timezone.utc).timestamp())
-          cal_ts = fetch_ts(os.environ["GIST_ID_CALENDAR"], "calendar.json")
-          mkt_ts = fetch_ts(os.environ["GIST_ID_MARKET"],   "market.json")
-          cal_age = now - to_epoch(cal_ts)
-          mkt_age = now - to_epoch(mkt_ts)
-          print(f"calendar age: {cal_age}s")
-          print(f"market   age: {mkt_age}s")
-          skip = (mkt_age < 240 and cal_age < 600)
-          with open(out_path, "a") as f:
+
+          # Ages
+          cal_age = now - to_epoch((cal.get("meta") or {}).get("updated_utc",""))
+          mkt_age = now - to_epoch((mkt.get("meta") or {}).get("updated_utc",""))
+          hist_age_h = (now - to_epoch((hist.get("meta") or {}).get("updated_utc",""))) / 3600.0
+
+          # Macro cache checks
+          state = cal.get("state") or {}
+          mc = state.get("macro_cache") or {}
+          mc_events = mc.get("events") or []
+          mc_age_h = (now - to_epoch(mc.get("updated_utc",""))) / 3600.0 if mc.get("updated_utc") else 1e9
+
+          def covers_window(cache_from, cache_to, days=7):
+            try:
+              cf = dt.date.fromisoformat(cache_from); ct = dt.date.fromisoformat(cache_to)
+              rf = dt.datetime.now(dt.timezone.utc).date()
+              rt = rf + dt.timedelta(days=days)
+              return cf <= rf and ct >= rt
+            except Exception:
+              return False
+
+          macro_ok = bool(mc_events) and (mc_age_h < float(os.environ["MACRO_TTL_HOURS"])) \
+                     and covers_window(mc.get("from",""), mc.get("to",""))
+
+          # Greeks/quotes/chain coverage checks
+          quotes = mkt.get("quotes") or []
+          total_q = len(quotes)
+          with_delta = sum(1 for q in quotes if q.get("delta") is not None)
+          with_core  = sum(1 for q in quotes if all(q.get(k) is not None for k in ("bid","ask","oi","volume")))
+          greeks_cov_ok = (total_q >= int(os.environ["MIN_QUOTES"])) and (with_delta / max(1,total_q) >= float(os.environ["GREKS_COVERAGE_MIN"]))
+          quotes_cov_ok = (total_q >= int(os.environ["MIN_QUOTES"])) and (with_core  / max(1,total_q) >= float(os.environ["QUOTES_COVERAGE_MIN"]))
+
+          chain_metrics = mkt.get("chain_metrics") or []
+          chains_ok = (len(chain_metrics) >= int(os.environ["MIN_CHAIN_SYMBOLS"]))
+
+          # Freshness thresholds
+          cal_fresh = cal_age < int(os.environ["CAL_MAX_AGE_S"])
+          mkt_fresh = mkt_age < int(os.environ["MKT_MAX_AGE_S"])
+          hist_fresh= hist_age_h < float(os.environ["HIST_MAX_AGE_H"])
+
+          # Only skip if ALL are satisfied
+          skip = cal_fresh and mkt_fresh and hist_fresh and macro_ok and greeks_cov_ok and quotes_cov_ok and chains_ok
+
+          # Debug print
+          print(f"calendar age(s)={cal_age}  market age(s)={mkt_age}  history age(h)={hist_age_h:.1f}")
+          print(f"macro_ok={macro_ok} (events={len(mc_events)}, age_h={mc_age_h:.1f})  covers_window={covers_window(mc.get('from',''), mc.get('to',''))}")
+          print(f"quotes total={total_q}  with_delta={with_delta}  with_core={with_core}")
+          print(f"greeks_cov_ok={greeks_cov_ok}  quotes_cov_ok={quotes_cov_ok}  chains_ok={chains_ok}")
+          print(f"cal_fresh={cal_fresh}  mkt_fresh={mkt_fresh}  hist_fresh={hist_fresh}")
+          print(f"smart_skip_decision={skip}")
+
+          # Emit output
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
             f.write(f"skip={'true' if skip else 'false'}\n")
           PY
 
       - name: Run relay
-        if: ${{ steps.freshness.outputs.skip != 'true' }}
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.force_run == 'true' || steps.freshness.outputs.skip != 'true' }}
         env:
           TRADIER_TOKEN:    ${{ secrets.TRADIER_TOKEN }}
           FINNHUB_TOKEN:    ${{ secrets.FINNHUB_TOKEN }}
+          FMP_API_KEY:      ${{ secrets.FMP_API_KEY }}       # optional; used as macro fallback
           GIST_TOKEN:       ${{ secrets.GIST_TOKEN }}
           GIST_ID_CALENDAR: ${{ secrets.GIST_ID_CALENDAR }}
           GIST_ID_MARKET:   ${{ secrets.GIST_ID_MARKET }}
           GIST_ID_HISTORY:  ${{ secrets.GIST_ID_HISTORY }}
           TRADIER_BASE: https://api.tradier.com/v1
-          INTERVAL_SEC: "300"     # tag only; cron cadence controls runs
-          RELAY_WORKERS: "8"      # parallel per-symbol work (ThreadPool)
-          TIERB_LIMIT: "40"       # optional cap on Tier-B symbols during heavy weeks
-        run: python relay_us_options_tradier.py
+          INTERVAL_SEC: "300"
+          RELAY_WORKERS: "8"
+          TIERB_LIMIT: "40"
+          MACRO_TTL_HOURS: "12"
+        run: |
+          echo "[relay] force_run=${{ github.event_name == 'workflow_dispatch' && inputs.force_run }}"
+          python relay_us_options_tradier.py
