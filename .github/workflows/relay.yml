@@ -54,18 +54,18 @@ jobs:
       - name: "Skip if feeds are fresh (smart: macro TTL + greeks/quotes/chain/history)"
         id: freshness
         env:
-          GIST_TOKEN:         ${{ secrets.GIST_TOKEN }}
-          GIST_ID_CALENDAR:   ${{ secrets.GIST_ID_CALENDAR }}
-          GIST_ID_MARKET:     ${{ secrets.GIST_ID_MARKET }}
-          GIST_ID_HISTORY:    ${{ secrets.GIST_ID_HISTORY }}
-          MACRO_TTL_HOURS:    "12"    # recache macro at most every 12h
-          CAL_MAX_AGE_S:      "600"   # 10 minutes
-          MKT_MAX_AGE_S:      "240"   # 4 minutes
-          HIST_MAX_AGE_H:     "168"   # 7 days
-          GREEKS_COVERAGE_MIN:"0.60"  # >=60% of selected legs must have delta
-          QUOTES_COVERAGE_MIN:"0.70"  # >=70% of quotes must have bid/ask/oi/volume
-          MIN_QUOTES:         "8"     # expect at least 8 legs written
-          MIN_CHAIN_SYMBOLS:  "6"     # expect metrics for >=6 symbols
+          GIST_TOKEN:          ${{ secrets.GIST_TOKEN }}
+          GIST_ID_CALENDAR:    ${{ secrets.GIST_ID_CALENDAR }}
+          GIST_ID_MARKET:      ${{ secrets.GIST_ID_MARKET }}
+          GIST_ID_HISTORY:     ${{ secrets.GIST_ID_HISTORY }}
+          MACRO_TTL_HOURS:     "12"    # recache macro at most every 12h
+          CAL_MAX_AGE_S:       "600"   # 10 minutes
+          MKT_MAX_AGE_S:       "240"   # 4 minutes
+          HIST_MAX_AGE_H:      "168"   # 7 days
+          GREEKS_COVERAGE_MIN: "0.60"  # >=60% of selected legs must have delta
+          QUOTES_COVERAGE_MIN: "0.70"  # >=70% of quotes must have bid/ask/oi/volume
+          MIN_QUOTES:          "8"     # expect at least 8 legs written
+          MIN_CHAIN_SYMBOLS:   "6"     # expect metrics for >=6 symbols
         shell: bash
         run: |
           set -e
