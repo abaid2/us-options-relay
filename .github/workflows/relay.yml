@@ -1,4 +1,4 @@
-name: Relay (Tradier to Gists)
+name: Relay (Tradier to Gists — fast)
 
 on:
   schedule:
@@ -12,7 +12,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 6
+    timeout-minutes: 12
 
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +46,7 @@ jobs:
           done
           [ "$missing" -eq 0 ]
 
-      - name: Check freshness
+      - name: Skip if feeds are fresh (≤4m market, ≤10m calendar)
         id: freshness
         env:
           GIST_TOKEN:       ${{ secrets.GIST_TOKEN }}
@@ -57,9 +57,9 @@ jobs:
           set -e
           python - <<'PY'
           import os, json, urllib.request, datetime as dt
-          out = os.environ["GITHUB_OUTPUT"]
+          out_path = os.environ["GITHUB_OUTPUT"]
           hdr = {"Authorization": f"Bearer {os.environ['GIST_TOKEN']}",
-                 "Accept":"application/vnd.github+json"}
+                 "Accept": "application/vnd.github+json"}
           def fetch_ts(gist_id, name):
             try:
               req = urllib.request.Request(f"https://api.github.com/gists/{gist_id}", headers=hdr)
@@ -82,7 +82,7 @@ jobs:
           print(f"calendar age: {cal_age}s")
           print(f"market   age: {mkt_age}s")
           skip = (mkt_age < 240 and cal_age < 600)
-          with open(out, "a") as f:
+          with open(out_path, "a") as f:
             f.write(f"skip={'true' if skip else 'false'}\n")
           PY
 
@@ -96,6 +96,7 @@ jobs:
           GIST_ID_MARKET:   ${{ secrets.GIST_ID_MARKET }}
           GIST_ID_HISTORY:  ${{ secrets.GIST_ID_HISTORY }}
           TRADIER_BASE: https://api.tradier.com/v1
-          INTERVAL_SEC: "300"
+          INTERVAL_SEC: "300"     # tag only; cron cadence controls runs
+          RELAY_WORKERS: "8"      # parallel per-symbol work (ThreadPool)
+          TIERB_LIMIT: "40"       # optional cap on Tier-B symbols during heavy weeks
         run: python relay_us_options_tradier.py
-
