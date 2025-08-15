@@ -1,7 +1,5 @@
-Here’s the full updated relay_us_options_tradier.py with fast-mode concurrency, chain prefiltering, ATR caching, robust quotes fallbacks (chain + last-good), pretty-printed JSON, and history/chain metrics. Drop it into your repo as-is.
-
 #!/usr/bin/env python3
-# Publishes to your gists:
+# Publishes to gists:
 #   - calendar.json  (Tier-B earnings + macro with IST time)
 #   - market.json    (underliers + selected option quotes + chain metrics + EMA + caches)
 #   - history.json   (12–20 realized earnings comps per Tier-B symbol)
