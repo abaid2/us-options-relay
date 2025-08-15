@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Publishes to your gists:
 #   - calendar.json  (Tier-B earnings + macro with IST time + macro_cache state)
-#   - market.json    (underliers + selected option quotes + chain metrics + EMA + caches)
+#   - market.json    (underliers + selected option quotes + greeks + chain metrics + EMA + caches)
 #   - history.json   (12–20 realized earnings comps per Tier-B symbol)
 # Designed for GitHub Actions cron: fast, resilient, and light on API calls.
 
@@ -48,22 +48,22 @@ def to_ist_iso(ts):
     d = dt.datetime.fromisoformat(ts.replace("Z","+00:00")) if isinstance(ts, str) else ts
     return d.astimezone(IST).replace(microsecond=0).isoformat()
 
-def http_get_json(url, headers=None, params=None, timeout=20):
+def http_get_json(url, headers=None, params=None, timeout=25):
     r = requests.get(url, headers=headers, params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
 
 def gh_put(gist_id, filename, obj):
     url = f"https://api.github.com/gists/{gist_id}"
-    payload = {"files": {filename: {"content": json.dumps(obj, indent=2)}}}  # pretty-print for viewer tools
-    r = requests.patch(url, headers=HDR_GH, json=payload, timeout=20)
+    payload = {"files": {filename: {"content": json.dumps(obj, indent=2)}}}  # pretty-print for raw viewer tools
+    r = requests.patch(url, headers=HDR_GH, json=payload, timeout=25)
     r.raise_for_status()
 
 def gh_get(gist_id, filename):
     """Read a single file's JSON content from a gist; return parsed obj or None."""
     try:
         url = f"https://api.github.com/gists/{gist_id}"
-        r = requests.get(url, headers=HDR_GH, timeout=20)
+        r = requests.get(url, headers=HDR_GH, timeout=25)
         r.raise_for_status()
         j = r.json()
         f = (j.get("files") or {}).get(filename)
@@ -144,7 +144,7 @@ def fetch_macro_live_fmp(from_date, to_date):
         return []
 
 def fetch_macro_cached(req_from, req_to):
-    # try to reuse calendar.json -> state.macro_cache when fresh & covering window
+    # Try to reuse calendar.json -> state.macro_cache when fresh & covering window
     prev_cal = gh_get(GIST_ID_CAL, "calendar.json") or {}
     state    = prev_cal.get("state", {}) if isinstance(prev_cal, dict) else {}
     cache    = state.get("macro_cache", {}) if isinstance(state, dict) else {}
@@ -213,9 +213,10 @@ def chains(sym, exp):
     opts = (j.get("options") or {}).get("option") or []
     return [opts] if isinstance(opts, dict) else opts
 
-# Robust options quotes batching (URL-length aware + binary split + OCC validation)
+# ── Robust options quotes batching (URL-length aware + binary split + OCC validation)
 _OCC_RE  = re.compile(r'^[A-Z.]{1,6}\d{6}[CP]\d{8}$')
 _OCC_TYPE_RE = re.compile(r'\d{6}([CP])\d{8}$')
+_OCC_STRIKE_RE = re.compile(r'(\d{8})$')
 _MAX_URL = 1500  # conservative full-URL length cap
 
 def _is_valid_occ(sym: str) -> bool:
@@ -225,6 +226,12 @@ def _occ_type(sym: str):
     m = _OCC_TYPE_RE.search(sym or "")
     if not m: return None
     return "call" if m.group(1) == "C" else "put"
+
+def _occ_strike(sym: str):
+    m = _OCC_STRIKE_RE.search(sym or "")
+    if not m: return None
+    try: return int(m.group(1))/1000.0
+    except: return None
 
 def _fetch_quotes_chunk(chunk_syms):
     params = {"symbols": ",".join(chunk_syms), "greeks": "true"}
@@ -485,7 +492,6 @@ def main():
 
     # Calendars
     earn  = fetch_earnings(from_date, to_date)
-
     macro_to = (now + timedelta(days=7)).date().isoformat()
     macro_pkg = fetch_macro_cached(from_date, macro_to)
     macro     = macro_pkg["events"]
@@ -549,11 +555,11 @@ def main():
             desired = nearest_friday_on_or_after(e_dates[0]) if e_dates else nearest_friday_on_or_after((now + timedelta(days=7)).date().isoformat())
             expiry  = pick_expiration(u, desired)
             if not expiry:
-                return {"underlier": {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()}, "cm": None, "legs": [], "fallback": {}}
+                return {"underlier": {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()}, "cm": None, "legs": [], "fallback": {}, "selection": {}}
 
             chain = chains(u, expiry)
             if not chain:
-                return {"underlier": {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()}, "cm": None, "legs": [], "fallback": {}}
+                return {"underlier": {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()}, "cm": None, "legs": [], "fallback": {}, "selection": {}}
 
             cm = chain_metrics_from_chain(chain)
 
@@ -567,6 +573,7 @@ def main():
 
             legs = []
             fallback = {}
+            selection = {}
 
             if pass_chain:
                 # ATM pair + ±2 strike wings for resilience
@@ -591,7 +598,10 @@ def main():
                     for sym, q in byq.items():
                         typ = _occ_type(sym)
                         if typ != side: continue
-                        d = float((q.get("greeks") or {}).get("delta") or 0)
+                        try:
+                            d = float((q.get("greeks") or {}).get("delta") or 0)
+                        except:
+                            d = 0
                         if d == 0: continue
                         d_abs = abs(d)
                         dd = abs(d_abs - target)
@@ -607,12 +617,14 @@ def main():
                     sym = qrow.get("symbol")
                     if not sym: return None
                     strike = qrow.get("strike")
+                    if strike is None: strike = _occ_strike(sym)
                     try: strike = float(strike) if strike is not None else None
                     except: strike = None
                     return {"symbol": sym, "strike": strike, "option_type": _occ_type(sym)}
 
-                for row in (c15, c20, p15, p20):
+                for tag, row in (("call_15",c15), ("call_20",c20), ("put_15",p15), ("put_20",p20)):
                     leg = q_to_leg(row)
+                    selection[tag] = leg["symbol"] if leg else None
                     if leg: legs.append(leg)
 
                 # chain fallback map for just the selected legs
@@ -633,7 +645,8 @@ def main():
                 "underlier": {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()},
                 "cm": {"u": u, "expiry": expiry, **cm},
                 "legs": legs,
-                "fallback": fallback
+                "fallback": fallback,
+                "selection": selection
             }
         except Exception:
             return None
@@ -649,24 +662,22 @@ def main():
     # Aggregate results
     underliers, opt_symbols, sel_meta, chain_metrics = [], [], [], []
     chain_index_fallback_all = {}
+    wing_selection = {}
     for r in results:
         if r.get("underlier"): underliers.append(r["underlier"])
         if r.get("cm"):        chain_metrics.append(r["cm"])
         if r.get("fallback"):  chain_index_fallback_all.update(r["fallback"])
+        if r.get("selection"): wing_selection[r["cm"]["u"]] = r["selection"]
         for leg in r.get("legs", []):
             sym = leg.get("symbol")
             if sym:
+                strike = leg.get("strike")
+                if strike is None: strike = _occ_strike(sym)
                 opt_symbols.append(sym)
-                # handle legs from chain rows and from q_to_leg dicts
-                leg_type = leg.get("option_type") or ("call" if _occ_type(sym)=="call" else "put")
-                strike   = leg.get("strike")
-                if strike is None:
-                    # try to pull strike from OCC symbol if missing (optional)
-                    pass
                 sel_meta.append({
                     "u": r["cm"]["u"],
                     "expiry": r["cm"]["expiry"],
-                    "type": ("C" if leg_type=="call" else "P"),
+                    "type": ("C" if (leg.get("option_type") or _occ_type(sym))=="call" else "P"),
                     "strike": float(strike) if strike is not None else None,
                     "contract": sym
                 })
@@ -675,8 +686,7 @@ def main():
     qts = quotes_options(opt_symbols)
     by_sym = {q.get("symbol"): q for q in qts} if qts else {}
 
-    # Build quotes with fallbacks (quotes -> chain -> last_good)
-    # Reload prev state for last_good & ATR cache (updated inside loop)
+    # Build quotes with fallbacks (quotes -> chain -> last_good), and persist greeks
     prev_market = gh_get(GIST_ID_MKT, "market.json") or {}
     prev_state  = prev_market.get("state", {}) if isinstance(prev_market, dict) else {}
     prev_last_good = prev_state.get("last_good_quotes", {}) if isinstance(prev_state, dict) else {}
@@ -689,12 +699,24 @@ def main():
         q   = by_sym.get(m["contract"], {})
         bid = q.get("bid"); ask = q.get("ask"); last = q.get("last")
         oi  = q.get("open_interest"); vol = q.get("volume")
-        iv  = None
+
+        # greeks
+        delta = gamma = theta = vega = None
+        iv = None
         if q.get("greeks"):
-            iv = q["greeks"].get("mid_iv") or q["greeks"].get("smv_vol")
+            g = q["greeks"]
+            def f(x):
+                try: return float(x)
+                except: return None
+            iv    = f(g.get("mid_iv")) or f(g.get("smv_vol"))
+            delta = f(g.get("delta"))
+            gamma = f(g.get("gamma"))
+            theta = f(g.get("theta"))
+            vega  = f(g.get("vega"))
+
         ts  = q.get("trade_date") or q.get("updated") or now_utc_iso()
 
-        # 1) fallback to chain() if missing
+        # 1) fallback to chain() if missing core tape
         if (bid is None) or (ask is None) or (oi is None) or (vol is None):
             fb = chain_index_fallback_all.get(m["contract"])
             if fb:
@@ -713,7 +735,7 @@ def main():
                 vol = lg.get("volume")  if vol is None else vol
                 ts  = lg.get("quote_time_utc") or ts
 
-        # Update last_good if we now have all key fields
+        # update last_good if we now have all core fields
         if (bid is not None) and (ask is not None) and (oi is not None) and (vol is not None):
             last_good[m["contract"]] = {
                 "bid": float(bid), "ask": float(ask), "oi": int(oi), "volume": int(vol),
@@ -728,6 +750,7 @@ def main():
             "last": float(last) if last is not None else None,
             "spread_pct": spread_pct(bid, ask),
             "iv": float(iv) if iv is not None else None,
+            "delta": delta, "gamma": gamma, "theta": theta, "vega": vega,
             "oi": int(oi) if oi is not None else None,
             "volume": int(vol) if vol is not None else None,
             "quote_time_utc": ts
@@ -747,16 +770,30 @@ def main():
         ema_val = ema_update(prev, x, alpha=0.15)
         ema_out[sym] = {"ema30": ema_val, "last_date": dt.datetime.now(UTC).date().isoformat()}
 
+    # Coverage stats for smart-skip
+    with_delta = sum(1 for q in quotes if q.get("delta") is not None)
+    with_core  = sum(1 for q in quotes if all(q.get(k) is not None for k in ("bid","ask","oi","volume")))
+    total_q    = len(quotes)
+    greeks_ratio = round(with_delta/total_q, 3) if total_q else None
+    core_ratio   = round(with_core/total_q, 3) if total_q else None
+
     # Publish market.json
     market_payload = {
-        "meta": {"source": "tradier", "updated_utc": now_utc_iso(), "interval_sec": INTERVAL_SEC},
+        "meta": {
+            "source": "tradier",
+            "updated_utc": now_utc_iso(),
+            "interval_sec": INTERVAL_SEC,
+            "greeks_coverage": {"with_delta": with_delta, "total": total_q, "ratio": greeks_ratio},
+            "quotes_core_coverage": {"with_core": with_core, "total": total_q, "ratio": core_ratio}
+        },
         "underliers": underliers,
         "quotes": quotes,
         "chain_metrics": chain_metrics,
         "state": {
             "ema": ema_out,
             "last_good_quotes": last_good,
-            "atr_cache": prev_atr
+            "atr_cache": prev_atr,
+            "wing_selection": wing_selection
         }
     }
     gh_put(GIST_ID_MKT, "market.json", market_payload)
