@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # Clean relay — Tradier options + optional Finnhub earnings
 # Publishes:
-#   - market.json   (underliers + selected option quotes + greeks + chain metrics + EMA + caches)
-#   - history.json  (12–20 realized earnings comps per Tier-B symbol; only if FINNHUB_TOKEN)
+#   - market.json   (underliers + selected option quotes + greeks + chain metrics + EMA + caches + tape-lite)
+#   - history.json  (12–20 realized earnings comps per symbol; Tier-A + Tier-B; only if FINNHUB_TOKEN)
 #   - calendar.json (optional; only if GIST_ID_CALENDAR is set; contains Tier-A and Tier-B earnings list)
 #
 # Design goals: fast, robust, minimal external dependencies.
@@ -23,9 +23,10 @@ GIST_ID_HISTORY = os.environ.get("GIST_ID_HISTORY")
 GIST_ID_CAL     = os.environ.get("GIST_ID_CALENDAR", "")  # optional; empty = skip calendar.json
 
 # Tuning
-INTERVAL_SEC   = int(os.environ.get("INTERVAL_SEC",   "300"))  # meta tag only
-RELAY_WORKERS  = int(os.environ.get("RELAY_WORKERS",  "8"))
-TIERB_LIMIT    = int(os.environ.get("TIERB_LIMIT",    "40"))   # cap Tier-B to lighten load (0 = no cap)
+INTERVAL_SEC     = int(os.environ.get("INTERVAL_SEC",   "300"))  # meta tag only
+RELAY_WORKERS    = int(os.environ.get("RELAY_WORKERS",  "8"))
+TIERB_LIMIT      = int(os.environ.get("TIERB_LIMIT",    "40"))   # cap Tier-B to lighten load (0 = no cap)
+TAPE_TIERA_ONLY  = os.environ.get("TAPE_TIERA_ONLY","1").lower() in ("1","true","yes")  # compute tape-lite only for Tier-A
 
 # Required envs
 assert TRADIER_TOKEN and TRADIER_BASE and GIST_TOKEN and GIST_ID_MARKET and GIST_ID_HISTORY, "Missing env vars."
@@ -73,8 +74,9 @@ def quote_underlier(sym):
     if not q: return None
     if isinstance(q, list): q = q[0]
     last = q.get("last") or q.get("close")
-    if not last and q.get("bid") and q.get("ask"):
-        last = (float(q["bid"]) + float(q["ask"])) / 2
+    if last is None and q.get("bid") is not None and q.get("ask") is not None:
+        try: last = (float(q["bid"]) + float(q["ask"])) / 2
+        except: last = None
     return float(last) if last is not None else None
 
 def daily_history(sym, start):
@@ -116,7 +118,7 @@ def _is_valid_occ(sym: str) -> bool:
 
 def _occ_type(sym: str):
     m = _OCC_TYPE_RE.search(sym or "")
-    return ("call" if m.group(1) == "C" else "put") if m else None
+    return ("call" if m and m.group(1) == "C" else "put") if m else None
 
 def _occ_strike(sym: str):
     m = _OCC_STRIKE_RE.search(sym or "")
@@ -168,6 +170,33 @@ def quotes_options(symbols):
             raise
     return out
 
+# Timesales (tape-lite)
+def timesales(sym, interval="1min", day=None):
+    if day is None:
+        day = dt.datetime.now(UTC).date().isoformat()
+    j = http_get_json(f"{TRADIER_BASE}/markets/timesales", headers=HDR_TR,
+                      params={"symbol": sym, "interval": interval, "start": day, "end": day, "session_filter":"all"})
+    rows = (j.get("series",{}) or {}).get("data") or []
+    return [rows] if isinstance(rows, dict) else rows
+
+def compute_vwap_1min(bars):
+    num=den=0.0
+    for r in bars:
+        v = float(r.get("volume") or 0); p = float(r.get("close") or 0)
+        num += v*p; den += v
+    return (num/den) if den>0 else None
+
+def rsi(values, n=5):
+    if len(values) < n+1: return None
+    gains=losses=0.0
+    for i in range(-n,0):
+        ch = values[i] - values[i-1]
+        if ch>=0: gains += ch
+        else:     losses -= ch
+    if losses == 0: return 100.0
+    rs = (gains/n)/(losses/n)
+    return 100 - 100/(1+rs)
+
 # ── Selection & metrics ──────────────────────────────────────────────────────
 def nearest_friday_on_or_after(date_str):
     y, m, d = map(int, date_str.split("-"))
@@ -182,7 +211,8 @@ def pick_expiration(sym, desired):
         if e >= desired: return e
     return exps[-1]
 
-def pick_targets(chain_rows, spot, how_many=2):
+def pick_targets(chain_rows, spot, how_many=5):
+    # ATM + ±how_many strike wings (default 5 to enable 15–20Δ strangles)
     calls = [c for c in chain_rows if (c.get("option_type") or "").lower() == "call"]
     puts  = [p for p in chain_rows if (p.get("option_type") or "").lower() == "put"]
     calls.sort(key=lambda x: abs(float(x.get("strike", 0)) - spot))
@@ -283,7 +313,7 @@ def compute_comps(symbol, earn_dates):
     out = []
     for d in earn_dates:
         d0 = dt.date.fromisoformat(d)
-        # find nearest trading D-1 and D+1
+        # nearest trading D-1 and D+1
         d_1 = next(( (d0 - timedelta(days=k)).isoformat() for k in range(1,4) if (d0 - timedelta(days=k)).isoformat() in idx ), None)
         d1  = next(( (d0 + timedelta(days=k)).isoformat() for k in range(1,4) if (d0 + timedelta(days=k)).isoformat() in idx ), None)
         bar_d0 = idx.get(d)
@@ -315,11 +345,13 @@ def main():
     symbols    = sorted(set(TIER_A + tierB_syms))
     print(f"[relay] symbols={len(symbols)} tierB={len(tierB_syms)}")
 
-    # Optional history.json (only if FINNHUB_TOKEN)
-    if FINNHUB_TOKEN and tierB_syms:
+    # Optional history.json (Tier-A + Tier-B; only if FINNHUB_TOKEN)
+    if FINNHUB_TOKEN:
+        # ETFs/indices will naturally skip (Finnhub returns no history)
+        candidates = sorted(set([s for s in TIER_A if s.isalpha()] + list(tierB_syms)))
         hist = gh_get(GIST_ID_HISTORY, "history.json") or {"meta":{}, "symbols":{}}
         symmap, changed = hist.setdefault("symbols", {}), False
-        for s in tierB_syms:
+        for s in candidates:
             last_ts = (symmap.get(s) or {}).get("_updated_utc")
             stale = True
             if last_ts:
@@ -350,12 +382,13 @@ def main():
         }
         gh_put(GIST_ID_CAL, "calendar.json", cal_payload)
 
-    # Load previous market state (EMA, last_good, ATR cache)
+    # Load previous market state (EMA, last_good, ATR cache, tape)
     prev_market    = gh_get(GIST_ID_MARKET, "market.json") or {}
     prev_state     = prev_market.get("state", {}) if isinstance(prev_market, dict) else {}
     prev_ema       = prev_state.get("ema", {}) if isinstance(prev_state, dict) else {}
     prev_last_good = prev_state.get("last_good_quotes", {}) if isinstance(prev_state, dict) else {}
     prev_atr       = prev_state.get("atr_cache", {}) if isinstance(prev_state, dict) else {}
+    prev_tape      = prev_state.get("tape", {}) if isinstance(prev_state, dict) else {}
 
     # Per-symbol work (parallel)
     hist_start   = (now - timedelta(days=120)).date().isoformat()
@@ -381,36 +414,58 @@ def main():
                 atr14 = atr_from_history(days[-80:],14) if days else None
                 atr_updates[u] = {"asof": now.date().isoformat(), "atr5": atr5, "atr14": atr14}
 
+            # Tape-lite (Tier-A only by default)
+            tape = prev_tape.get(u, {}).copy() if isinstance(prev_tape.get(u), dict) else {}
+            try:
+                prev_days = daily_history(u, (now - timedelta(days=10)).date().isoformat())
+                if prev_days and len(prev_days) >= 2:
+                    pd = prev_days[-2]
+                    tape["prev_high"] = float(pd["high"])
+                    tape["prev_low"]  = float(pd["low"])
+                if (not TAPE_TIERA_ONLY) or (u in TIER_A):
+                    bars1 = timesales(u, "1min")
+                    if bars1:
+                        closes = [float(r["close"]) for r in bars1 if r.get("close") is not None]
+                        tape["open"] = float(bars1[0]["open"]) if bars1 and bars1[0].get("open") is not None else tape.get("open")
+                        tape["vwap"] = compute_vwap_1min(bars1)
+                        tape["rsi5"] = rsi(closes, 5)
+                    bars5 = timesales(u, "5min")
+                    if bars5:
+                        vols5 = [int(r.get("volume") or 0) for r in bars5]
+                        tape["vol5m_now"]    = vols5[-1] if vols5 else tape.get("vol5m_now")
+                        tape["vol5m_median"] = sorted(vols5)[len(vols5)//2] if vols5 else tape.get("vol5m_median")
+            except Exception:
+                pass
+
             # pick expiry
             e_dates = [x["date"] for x in earn if x["symbol"] == u]
             desired = nearest_friday_on_or_after(e_dates[0]) if e_dates else nearest_friday_on_or_after((now + timedelta(days=7)).date().isoformat())
             expiry  = pick_expiration(u, desired)
+            under = {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso(), "tape": tape}
             if not expiry:
-                return {"underlier": {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()}}
+                return {"underlier": under}
 
             chain_rows = chains(u, expiry)
             if not chain_rows:
-                return {"underlier": {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()}}
+                return {"underlier": under}
 
             cm = chain_metrics_from_chain(chain_rows)
 
             # Chain prefilter (hard gates)
-            if cm.get("chain_oi_total", 0) < 15000:  # chain-wide OI
-                return {"underlier": {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()},
-                        "cm": {"u": u, "expiry": expiry, **cm}}
-
+            if cm.get("chain_oi_total", 0) < 15000:
+                return {"underlier": under, "cm": {"u": u, "expiry": expiry, **cm}}
             ms = cm.get("chain_median_spread_pct")
             if ms is not None and ms > 0.10:
-                return {"underlier": {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()},
-                        "cm": {"u": u, "expiry": expiry, **cm}}
+                return {"underlier": under, "cm": {"u": u, "expiry": expiry, **cm}}
 
-            picks = pick_targets(chain_rows, spot, how_many=2)
+            # ATM + ±5 strike wings
+            picks = pick_targets(chain_rows, spot, how_many=5)
             legs = []
             if picks["atm"]: legs += list(picks["atm"])
             for c_leg, p_leg in picks["wings"]:
                 legs += [c_leg, p_leg]
 
-            # chain fallback (bid/ask/oi/volume + greeks)
+            # chain fallback (bid/ask/oi/volume + greeks) for selected legs
             def fnum(x):
                 try: return float(x)
                 except: return None
@@ -428,7 +483,6 @@ def main():
                         "theta": fnum(g.get("theta")), "vega": fnum(g.get("vega")),
                     }
 
-            under = {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()}
             sel   = [{"u": u, "expiry": expiry, "type": ("C" if (l.get("option_type") or _occ_type(l.get("symbol")))=="call" else "P"),
                       "strike": float(l.get("strike") or _occ_strike(l.get("symbol"))),
                       "contract": l.get("symbol")} for l in legs if l.get("symbol")]
@@ -437,17 +491,25 @@ def main():
         except Exception:
             return None
 
+    # Run workers in parallel
+    chain_fallback_all = {}
     results = []
     with ThreadPoolExecutor(max_workers=RELAY_WORKERS) as ex:
-        for fut in as_completed({ex.submit(process_symbol, u): u for u in symbols}):
+        futs = {ex.submit(process_symbol, u): u for u in symbols}
+        for fut in as_completed(futs):
             r = fut.result()
             if not r: continue
-            if r.get("underlier"): underliers.append(r["underlier"])
-            if r.get("cm"):        chain_metrics.append(r["cm"])
-            if r.get("sel"):
-                sel_meta.extend(r["sel"])
-                opt_symbols.extend([s["contract"] for s in r["sel"]])
-            if r.get("fallback"):  chain_fallback_all.update(r["fallback"])
+            results.append(r)
+
+    # Aggregate
+    underliers, chain_metrics, sel_meta, opt_symbols = [], [], [], []
+    for r in results:
+        if r.get("underlier"): underliers.append(r["underlier"])
+        if r.get("cm"):        chain_metrics.append(r["cm"])
+        if r.get("sel"):
+            sel_meta.extend(r["sel"])
+            opt_symbols.extend([s["contract"] for s in r["sel"]])
+        if r.get("fallback"):  chain_fallback_all.update(r["fallback"])
 
     # Quotes for selected legs
     qts   = quotes_options(opt_symbols)
@@ -460,6 +522,7 @@ def main():
         q   = bysym.get(m["contract"], {})
         bid = q.get("bid"); ask = q.get("ask"); last = q.get("last")
         oi  = q.get("open_interest"); vol = q.get("volume")
+
         # greeks
         def f(x):
             try: return float(x)
@@ -521,8 +584,15 @@ def main():
     ema_out = {}
     for cm in chain_metrics:
         sym = cm["u"]; x = cm.get("chain_notional_today", 0.0) or 0.0
-        prev = (prev_state.get("ema", {}) or {}).get(sym, {}).get("ema30") if isinstance(prev_state, dict) else None
+        prev = (prev_ema.get(sym) or {}).get("ema30") if isinstance(prev_ema.get(sym), dict) else None
         ema_out[sym] = {"ema30": ema_update(prev, x, alpha=0.15), "last_date": now.date().isoformat()}
+
+    # Tape state
+    tape_state = {}
+    for urow in underliers:
+        u = urow["u"]
+        t = urow.get("tape")
+        if t: tape_state[u] = t
 
     # Coverage stats
     with_delta = sum(1 for q in quotes if q.get("delta") is not None)
@@ -546,7 +616,8 @@ def main():
         "state": {
             "ema": ema_out,
             "last_good_quotes": last_good,
-            "atr_cache": prev_atr
+            "atr_cache": prev_atr,
+            "tape": tape_state
         }
     }
     gh_put(GIST_ID_MARKET, "market.json", market_payload)
