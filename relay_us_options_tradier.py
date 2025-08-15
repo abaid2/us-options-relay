@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Publishes to your gists:
-#   - calendar.json  (Tier-B earnings + macro with IST time + macro_cache state)
+#   - calendar.json  (Tier-B earnings + macro with IST time + state.macro_cache)
 #   - market.json    (underliers + selected option quotes + greeks + chain metrics + EMA + caches)
 #   - history.json   (12–20 realized earnings comps per Tier-B symbol)
 # Designed for GitHub Actions cron: fast, resilient, and light on API calls.
@@ -23,7 +23,9 @@ FMP_API_KEY   = os.environ.get("FMP_API_KEY", "")
 INTERVAL_SEC  = int(os.environ.get("INTERVAL_SEC", "300"))   # tag only
 RELAY_WORKERS = int(os.environ.get("RELAY_WORKERS", "8"))    # thread pool size
 TIERB_LIMIT   = int(os.environ.get("TIERB_LIMIT", "0"))      # 0 = no cap
-MACRO_TTL_HOURS = int(os.environ.get("MACRO_TTL_HOURS", "12"))
+MACRO_TTL_HOURS   = int(os.environ.get("MACRO_TTL_HOURS", "12"))
+MACRO_FORCE_REFRESH = os.environ.get("MACRO_FORCE_REFRESH", "").strip() in ("1","true","True")
+MACRO_WINDOW_DAYS = int(os.environ.get("MACRO_WINDOW_DAYS", "14"))
 
 assert all([TRADIER_TOKEN, TRADIER_BASE, FINNHUB_TOKEN, GIST_TOKEN, GIST_ID_CAL, GIST_ID_MKT, GIST_ID_HIST]), "Missing env vars."
 
@@ -126,25 +128,41 @@ def fetch_macro_live_finnhub(from_date, to_date):
         return []
 
 def fetch_macro_live_fmp(from_date, to_date):
-    if not FMP_API_KEY:
+    key = os.environ.get("FMP_API_KEY", "")
+    if not key:
         return []
-    try:
-        j = http_get_json("https://financialmodelingprep.com/api/v4/economic_calendar",
-                          params={"from": from_date, "to": to_date, "apikey": FMP_API_KEY})
-        evts=[]
-        for x in (j or []):
-            name=(x.get("event") or "").upper()
-            if any(k in name for k in ["CPI","PCE","NON-FARM","PAYROLL","FOMC","FED","JOBS","UNEMPLOYMENT"]):
-                d = x.get("date") or x.get("timestamp") or ""
-                iso = (d.replace(" ", "T")+"Z") if ("T" not in d) else d
-                evts.append({"event": name,
-                             "utc_time": dt.datetime.fromisoformat(iso.replace("Z","+00:00")).replace(microsecond=0).isoformat()})
+    def _parse_fmp(arr):
+        evts = []
+        for x in (arr or []):
+            name = (x.get("event") or x.get("eventName") or "").upper()
+            if not name:
+                continue
+            if any(k in name for k in ["CPI","CORE CPI","PCE","NON-FARM","PAYROLL","NFP","FOMC","FED","JOBS","UNEMPLOYMENT","ISM","FOMC MINUTES"]):
+                d = x.get("datetime") or x.get("date") or x.get("timestamp") or ""
+                if not d:
+                    continue
+                iso = d if "T" in d else d.replace(" ", "T") + "Z"
+                try:
+                    uts = dt.datetime.fromisoformat(iso.replace("Z","+00:00")).replace(microsecond=0).isoformat()
+                    evts.append({"event": name, "utc_time": uts})
+                except Exception:
+                    continue
         return _dedupe_macro(evts)
+    try:
+        j4 = http_get_json("https://financialmodelingprep.com/api/v4/economic_calendar",
+                           params={"from": from_date, "to": to_date, "apikey": key})
+        evts = _parse_fmp(j4)
+        if evts: return evts
+    except Exception:
+        pass
+    try:
+        j3 = http_get_json("https://financialmodelingprep.com/api/v3/economic_calendar",
+                           params={"from": from_date, "to": to_date, "apikey": key})
+        return _parse_fmp(j3)
     except Exception:
         return []
 
 def fetch_macro_cached(req_from, req_to):
-    # Try to reuse calendar.json -> state.macro_cache when fresh & covering window
     prev_cal = gh_get(GIST_ID_CAL, "calendar.json") or {}
     state    = prev_cal.get("state", {}) if isinstance(prev_cal, dict) else {}
     cache    = state.get("macro_cache", {}) if isinstance(state, dict) else {}
@@ -152,11 +170,13 @@ def fetch_macro_cached(req_from, req_to):
     cached_from   = cache.get("from")
     cached_to     = cache.get("to")
     cached_ts     = cache.get("updated_utc")
-    if cached_events and cached_from and cached_to and cached_ts:
-        if _covers_window(cached_from, cached_to, req_from, req_to) and _age_hours(cached_ts) < MACRO_TTL_HOURS:
-            return {"events": cached_events, "source": cache.get("source","cache"), "used_cache": True, "cache": cache}
 
-    # otherwise fetch live (Finnhub → FMP fallback), then store/return
+    cache_covers = cached_events and cached_from and cached_to and _covers_window(cached_from, cached_to, req_from, req_to)
+    cache_fresh  = cached_ts and _age_hours(cached_ts) < MACRO_TTL_HOURS
+
+    if cache_covers and cache_fresh and not MACRO_FORCE_REFRESH:
+        return {"events": cached_events, "source": cache.get("source","cache"), "used_cache": True, "cache": cache}
+
     evts = fetch_macro_live_finnhub(req_from, req_to)
     source="finnhub"
     if not evts:
@@ -168,7 +188,6 @@ def fetch_macro_cached(req_from, req_to):
                      "source": source, "events": evts}
         return {"events": evts, "source": source, "used_cache": False, "cache": new_cache}
 
-    # last resort: return stale cache if present
     if cached_events:
         return {"events": cached_events, "source": "stale-cache", "used_cache": True, "cache": cache}
 
@@ -208,8 +227,9 @@ def expirations(sym):
     return [exps] if isinstance(exps, str) else sorted(exps)
 
 def chains(sym, exp):
+    # include greeks=true so ORATS greeks + IV are present on each chain row
     j = http_get_json(f"{TRADIER_BASE}/markets/options/chains", headers=HDR_TR,
-                      params={"symbol": sym, "expiration": exp})
+                      params={"symbol": sym, "expiration": exp, "greeks": "true"})
     opts = (j.get("options") or {}).get("option") or []
     return [opts] if isinstance(opts, dict) else opts
 
@@ -339,15 +359,13 @@ def _index_daily_by_date(days):
     return idx
 
 def fh_earnings_history(symbol, max_quarters=20):
-    """Return most-recent earnings dates (YYYY-MM-DD), newest first."""
     dates = []
     try:
         j = http_get_json("https://finnhub.io/api/v1/stock/earnings",
                           params={"symbol": symbol, "token": FINNHUB_TOKEN})
         for r in (j or []):
             d = r.get("date") or r.get("period")
-            if d:
-                dates.append(str(d)[:10])
+            if d: dates.append(str(d)[:10])
     except Exception:
         dates = []
     if not dates:
@@ -365,7 +383,6 @@ def fh_earnings_history(symbol, max_quarters=20):
     return dates
 
 def fh_when_for_date(symbol, date_str):
-    """Return 'AMC'/'BMO'/'' for a specific date; single-day lookup."""
     try:
         j = http_get_json("https://finnhub.io/api/v1/calendar/earnings",
                           params={"from": date_str, "to": date_str, "token": FINNHUB_TOKEN})
@@ -382,19 +399,15 @@ def compute_comps(symbol, earn_dates, when_map=None):
     For each earnings date:
       AMC -> gap% = |Open_{D+1} - Close_{D0}| / Close_{D0}; range% = (High_{D+1} - Low_{D+1}) / Close_{D0}
       BMO -> gap% = |Open_{D0} - Close_{D-1}| / Close_{D-1}; range% = (High_{D0} - Low_{D0}) / Close_{D-1}
-    Skips entries when any required bar is missing.
     """
     start = (dt.datetime.now(UTC) - timedelta(days=3*365)).date().isoformat()
     days  = daily_history(symbol, start)
     if not days: return []
     idx = _index_daily_by_date(days)
     out = []
-
     for d in earn_dates:
         w = (when_map or {}).get(d, "") or fh_when_for_date(symbol, d) or ""
         d0 = dt.date.fromisoformat(d)
-
-        # closest available D-1 and D+1 within ±3 days
         d_1 = None; d1 = None
         for k in range(1, 4):
             cand = (d0 - timedelta(days=k)).isoformat()
@@ -402,28 +415,24 @@ def compute_comps(symbol, earn_dates, when_map=None):
         for k in range(1, 4):
             cand = (d0 + timedelta(days=k)).isoformat()
             if cand in idx: d1 = cand; break
-
         bar_d0 = idx.get(d)
         if w == "AMC":
             if not (bar_d0 and d1 and (d in idx) and (d1 in idx)): continue
             c0 = idx[d]["c"]; o1 = idx[d1]["o"]; h1 = idx[d1]["h"]; l1 = idx[d1]["l"]
             gap = abs(o1 - c0)/c0
             rng = (h1 - l1)/c0
-        else:  # default to BMO (or unknown)
+        else:
             if not (d_1 and (d_1 in idx) and bar_d0): continue
             c_1 = idx[d_1]["c"]; o0 = bar_d0["o"]; h0 = bar_d0["h"]; l0 = bar_d0["l"]
             gap = abs(o0 - c_1)/c_1
             rng = (h0 - l0)/c_1
-
         out.append({"date": d, "when": (w or "BMO"), "gap_pct": round(gap, 6), "range_pct": round(rng, 6)})
     return out
 
 def build_history_for_symbols(symbols, max_quarters=20):
-    """Update history.json with comps for the provided symbols if stale (>7 days) or missing."""
     hist = gh_get(GIST_ID_HIST, "history.json") or {"meta":{}, "symbols":{}}
     symmap = hist.setdefault("symbols", {})
     changed = False
-
     for sym in symbols:
         s = sym.upper()
         try:
@@ -436,7 +445,6 @@ def build_history_for_symbols(symbols, max_quarters=20):
                 except Exception:
                     stale = True
             if not stale: continue
-
             dates = fh_earnings_history(s, max_quarters=max_quarters)
             if not dates: continue
             comps = compute_comps(s, dates, when_map={})
@@ -445,20 +453,12 @@ def build_history_for_symbols(symbols, max_quarters=20):
                 changed = True
         except Exception:
             continue
-
     if changed:
         hist["meta"] = {"updated_utc": now_utc_iso(), "lookback_years": 3}
         gh_put(GIST_ID_HIST, "history.json", hist)
 
 # ── Chain metrics + EMA ──────────────────────────────────────────────────────
 def chain_metrics_from_chain(chain):
-    """
-    Compute chain-wide:
-      - chain_oi_total (sum open_interest)
-      - chain_median_spread_pct (median (ask-bid)/mid, where bid/ask>0)
-      - chain_notional_today (sum volume * mid * 100)
-    Using only fields present on /markets/options/chains rows.
-    """
     oi_sum = 0
     spreads = []
     notional = 0.0
@@ -492,9 +492,10 @@ def main():
 
     # Calendars
     earn  = fetch_earnings(from_date, to_date)
-    macro_to = (now + timedelta(days=7)).date().isoformat()
+    macro_to = (now + timedelta(days=MACRO_WINDOW_DAYS)).date().isoformat()
     macro_pkg = fetch_macro_cached(from_date, macro_to)
     macro     = macro_pkg["events"]
+    print(f"[relay] macro_source={macro_pkg.get('source')} used_cache={macro_pkg.get('used_cache')} count={len(macro)}")
 
     # Tier-B symbols; optional cap (keep earliest by date)
     if TIERB_LIMIT and TIERB_LIMIT > 0 and len(earn) > TIERB_LIMIT:
@@ -503,14 +504,21 @@ def main():
     else:
         tierB_syms = sorted({e["symbol"] for e in earn})
     symbols = sorted(set(TIER_A + tierB_syms))
+    print(f"[relay] symbols={len(symbols)} tierB={len(tierB_syms)}")
 
-    # Build/refresh realized comps for Tier-B only (very light)
+    # Build/refresh realized comps for Tier-B only
     if tierB_syms:
         build_history_for_symbols(tierB_syms, max_quarters=20)
 
     # Publish calendar.json (with macro_cache state)
     cal_payload = {
-        "meta":  {"source":"finnhub","updated_utc": now_utc_iso(), "window_from": from_date, "window_to": to_date},
+        "meta":  {
+            "source":"finnhub",
+            "updated_utc": now_utc_iso(),
+            "window_from": from_date,
+            "window_to": to_date,
+            "macro_source": macro_pkg.get("source","")
+        },
         "tierA": TIER_A,
         "tierB": earn,
         "macro":[{**m, "ist_time": to_ist_iso(m["utc_time"])} for m in macro],
@@ -518,28 +526,29 @@ def main():
     }
     gh_put(GIST_ID_CAL, "calendar.json", cal_payload)
 
-    # Load previous market for state (EMA, last_good, ATR cache)
+    # Load previous market state
     prev_market    = gh_get(GIST_ID_MKT, "market.json") or {}
     prev_state     = prev_market.get("state", {}) if isinstance(prev_market, dict) else {}
     prev_ema       = prev_state.get("ema", {}) if isinstance(prev_state, dict) else {}
     prev_last_good = prev_state.get("last_good_quotes", {}) if isinstance(prev_state, dict) else {}
     prev_atr       = prev_state.get("atr_cache", {}) if isinstance(prev_state, dict) else {}
 
-    # Collections to fill
+    # Collections
     underliers, opt_symbols, sel_meta, chain_metrics = [], [], [], []
     chain_index_fallback_all = {}
+    wing_selection = {}
     atr_updates = {}
     hist_start = (now - timedelta(days=120)).date().isoformat()
     today_date = dt.datetime.now(UTC).date().isoformat()
 
-    # Per-symbol worker (spot, ATR (with cache), expiry, chain, metrics, legs, fallbacks)
+    # Per-symbol worker
     def process_symbol(u):
         try:
             spot = quote_underlier(u)
             if not spot:
                 return None
 
-            # ATR from cache if same day; else compute and return update
+            # ATR cache
             atr5 = atr14 = None
             cache = prev_atr.get(u)
             if cache and cache.get("asof") == today_date:
@@ -550,7 +559,7 @@ def main():
                 atr14 = atr_from_history(days[-80:],14) if days else None
                 atr_updates[u] = {"asof": today_date, "atr5": atr5, "atr14": atr14}
 
-            # choose expiry
+            # expiry
             e_dates = [x["date"] for x in earn if x["symbol"]==u]
             desired = nearest_friday_on_or_after(e_dates[0]) if e_dates else nearest_friday_on_or_after((now + timedelta(days=7)).date().isoformat())
             expiry  = pick_expiration(u, desired)
@@ -563,7 +572,7 @@ def main():
 
             cm = chain_metrics_from_chain(chain)
 
-            # Pre-filter: only fetch quotes for chains that pass hard gates
+            # Chain prefilter gates
             pass_chain = True
             if cm.get("chain_oi_total", 0) < 15000:
                 pass_chain = False
@@ -576,67 +585,77 @@ def main():
             selection = {}
 
             if pass_chain:
-                # ATM pair + ±2 strike wings for resilience
+                # ATM + ±2 strike wings
                 picks = pick_targets(chain, spot, how_many=2)
                 if picks["atm"]:
                     legs += list(picks["atm"])
                 for c_leg, p_leg in picks["wings"]:
                     legs += [c_leg, p_leg]
 
-                # Widen pool around spot to ±5 nearest per side
+                # widen pool ±5 per side and select ~15Δ/~20Δ wings using chain greeks
                 calls = sorted([c for c in chain if (c.get("option_type") or "").lower()=="call"], key=lambda x: abs(float(x.get("strike",0))-spot))
                 puts  = sorted([p for p in chain if (p.get("option_type") or "").lower()=="put"],  key=lambda x: abs(float(x.get("strike",0))-spot))
                 pool  = calls[:6] + puts[:6]
 
-                # Get greeks for the pool and select 15Δ & 20Δ wings
-                pool_syms = [x.get("symbol") for x in pool if x.get("symbol")]
-                pool_q    = quotes_options(pool_syms)
-                byq       = {q.get("symbol"): q for q in pool_q}
+                # build symbol->greeks map from chain (ORATS greeks)
+                def fnum(x):
+                    try: return float(x)
+                    except: return None
+                by_chain = {}
+                for o in pool:
+                    sym = o.get("symbol")
+                    if not sym: continue
+                    g = o.get("greeks") or {}
+                    by_chain[sym] = {"delta": fnum(g.get("delta"))}
 
                 def best_delta(target, side):  # side: 'call' or 'put'
                     best = None; bd = 1e9
-                    for sym, q in byq.items():
-                        typ = _occ_type(sym)
+                    for o in pool:
+                        typ = (o.get("option_type") or "").lower()
                         if typ != side: continue
-                        try:
-                            d = float((q.get("greeks") or {}).get("delta") or 0)
-                        except:
-                            d = 0
-                        if d == 0: continue
+                        sym = o.get("symbol")
+                        d = by_chain.get(sym,{}).get("delta")
+                        if d is None: continue
                         d_abs = abs(d)
                         dd = abs(d_abs - target)
                         if dd < bd:
-                            bd = dd; best = q
+                            bd = dd; best = o
                     return best
 
                 c15 = best_delta(0.15, "call"); c20 = best_delta(0.20, "call")
                 p15 = best_delta(0.15, "put");  p20 = best_delta(0.20, "put")
 
-                def q_to_leg(qrow):
-                    if not qrow: return None
-                    sym = qrow.get("symbol")
+                def o_to_leg(o):
+                    if not o: return None
+                    sym = o.get("symbol")
                     if not sym: return None
-                    strike = qrow.get("strike")
+                    strike = o.get("strike")
                     if strike is None: strike = _occ_strike(sym)
                     try: strike = float(strike) if strike is not None else None
                     except: strike = None
-                    return {"symbol": sym, "strike": strike, "option_type": _occ_type(sym)}
+                    return {"symbol": sym, "strike": strike, "option_type": (o.get("option_type") or _occ_type(sym))}
 
                 for tag, row in (("call_15",c15), ("call_20",c20), ("put_15",p15), ("put_20",p20)):
-                    leg = q_to_leg(row)
+                    leg = o_to_leg(row)
                     selection[tag] = leg["symbol"] if leg else None
                     if leg: legs.append(leg)
 
-                # chain fallback map for just the selected legs
+                # chain fallback including greeks/iv for selected legs
                 leg_syms = {l.get("symbol") for l in legs if l.get("symbol")}
                 for o in chain:
                     if o.get("symbol") in leg_syms:
+                        g = o.get("greeks") or {}
                         try:
                             fallback[o["symbol"]] = {
-                                "bid": float(o.get("bid")) if o.get("bid") is not None else None,
-                                "ask": float(o.get("ask")) if o.get("ask") is not None else None,
+                                "bid": fnum(o.get("bid")),
+                                "ask": fnum(o.get("ask")),
                                 "volume": int(o.get("volume")) if o.get("volume") is not None else None,
-                                "oi": int(o.get("open_interest")) if o.get("open_interest") is not None else None
+                                "oi": int(o.get("open_interest")) if o.get("open_interest") is not None else None,
+                                "iv": fnum(g.get("mid_iv")) or fnum(g.get("smv_vol")),
+                                "delta": fnum(g.get("delta")),
+                                "gamma": fnum(g.get("gamma")),
+                                "theta": fnum(g.get("theta")),
+                                "vega": fnum(g.get("vega")),
                             }
                         except Exception:
                             pass
@@ -659,10 +678,7 @@ def main():
             r = fut.result()
             if r: results.append(r)
 
-    # Aggregate results
-    underliers, opt_symbols, sel_meta, chain_metrics = [], [], [], []
-    chain_index_fallback_all = {}
-    wing_selection = {}
+    # Aggregate
     for r in results:
         if r.get("underlier"): underliers.append(r["underlier"])
         if r.get("cm"):        chain_metrics.append(r["cm"])
@@ -682,17 +698,11 @@ def main():
                     "contract": sym
                 })
 
-    # Fetch quotes for selected legs (robust batching)
+    # Quotes for selected legs (robust batching)
     qts = quotes_options(opt_symbols)
     by_sym = {q.get("symbol"): q for q in qts} if qts else {}
 
-    # Build quotes with fallbacks (quotes -> chain -> last_good), and persist greeks
-    prev_market = gh_get(GIST_ID_MKT, "market.json") or {}
-    prev_state  = prev_market.get("state", {}) if isinstance(prev_market, dict) else {}
-    prev_last_good = prev_state.get("last_good_quotes", {}) if isinstance(prev_state, dict) else {}
-    prev_ema   = prev_state.get("ema", {}) if isinstance(prev_state, dict) else {}
-    prev_atr   = prev_state.get("atr_cache", {}) if isinstance(prev_state, dict) else {}
-
+    # Build quotes with fallbacks; persist greeks
     last_good = dict(prev_last_good)
     quotes = []
     for m in sel_meta:
@@ -700,7 +710,7 @@ def main():
         bid = q.get("bid"); ask = q.get("ask"); last = q.get("last")
         oi  = q.get("open_interest"); vol = q.get("volume")
 
-        # greeks
+        # greeks from quotes
         delta = gamma = theta = vega = None
         iv = None
         if q.get("greeks"):
@@ -716,16 +726,25 @@ def main():
 
         ts  = q.get("trade_date") or q.get("updated") or now_utc_iso()
 
-        # 1) fallback to chain() if missing core tape
+        # 1) fallback to chain() if core tape missing
         if (bid is None) or (ask is None) or (oi is None) or (vol is None):
             fb = chain_index_fallback_all.get(m["contract"])
             if fb:
-                bid = fb["bid"]     if bid is None else bid
-                ask = fb["ask"]     if ask is None else ask
-                oi  = fb["oi"]      if oi  is None else oi
-                vol = fb["volume"]  if vol is None else vol
+                bid = fb.get("bid")     if bid is None else bid
+                ask = fb.get("ask")     if ask is None else ask
+                oi  = fb.get("oi")      if oi  is None else oi
+                vol = fb.get("volume")  if vol is None else vol
 
-        # 2) fallback to last_good cache if still missing
+        # Fill greeks/iv from chain if missing
+        fb = chain_index_fallback_all.get(m["contract"])
+        if fb:
+            iv    = iv    if iv    is not None else fb.get("iv")
+            delta = delta if delta is not None else fb.get("delta")
+            gamma = gamma if gamma is not None else fb.get("gamma")
+            theta = theta if theta is not None else fb.get("theta")
+            vega  = vega  if vega  is not None else fb.get("vega")
+
+        # 2) fallback to last_good cache if still missing core fields
         if (bid is None) or (ask is None) or (oi is None) or (vol is None):
             lg = prev_last_good.get(m["contract"])
             if isinstance(lg, dict):
@@ -735,7 +754,7 @@ def main():
                 vol = lg.get("volume")  if vol is None else vol
                 ts  = lg.get("quote_time_utc") or ts
 
-        # update last_good if we now have all core fields
+        # Update last_good if we now have all core fields
         if (bid is not None) and (ask is not None) and (oi is not None) and (vol is not None):
             last_good[m["contract"]] = {
                 "bid": float(bid), "ask": float(ask), "oi": int(oi), "volume": int(vol),
@@ -757,7 +776,8 @@ def main():
         })
 
     # ATR cache updates from workers
-    prev_atr.update(atr_updates)
+    if atr_updates:
+        prev_atr.update(atr_updates)
 
     # Update EMA state from today's chain_notional
     ema_out = {}
@@ -770,12 +790,13 @@ def main():
         ema_val = ema_update(prev, x, alpha=0.15)
         ema_out[sym] = {"ema30": ema_val, "last_date": dt.datetime.now(UTC).date().isoformat()}
 
-    # Coverage stats for smart-skip
+    # Coverage stats + logs
     with_delta = sum(1 for q in quotes if q.get("delta") is not None)
     with_core  = sum(1 for q in quotes if all(q.get(k) is not None for k in ("bid","ask","oi","volume")))
     total_q    = len(quotes)
     greeks_ratio = round(with_delta/total_q, 3) if total_q else None
     core_ratio   = round(with_core/total_q, 3) if total_q else None
+    print(f"[relay] quotes_out={total_q} greeks_with_delta={with_delta} core={with_core}")
 
     # Publish market.json
     market_payload = {
