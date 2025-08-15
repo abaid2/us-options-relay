@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # Publishes to your gists:
-#   - calendar.json  (Tier-B earnings + macro with IST time + state.macro_cache)
-#   - market.json    (underliers + selected option quotes + greeks + chain metrics + EMA + caches)
+#   - calendar.json  (Tier-B earnings [optional via Finnhub] + MACRO from official sources + IST time + state.macro_cache)
+#   - market.json    (underliers + selected option quotes + greeks + chain metrics + EMA + caches + coverage stats)
 #   - history.json   (12–20 realized earnings comps per Tier-B symbol)
 # Designed for GitHub Actions cron: fast, resilient, and light on API calls.
 
-import os, json, re, urllib.parse
+import os, json, re, urllib.parse, html
 import datetime as dt
 from datetime import timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -14,20 +14,21 @@ import requests
 # ── ENV ──────────────────────────────────────────────────────────────────────
 TRADIER_TOKEN = os.environ.get("TRADIER_TOKEN")
 TRADIER_BASE  = os.environ.get("TRADIER_BASE", "https://api.tradier.com/v1")
-FINNHUB_TOKEN = os.environ.get("FINNHUB_TOKEN")
+# Finnhub for earnings is optional; macro is now official-free only
+FINNHUB_TOKEN = os.environ.get("FINNHUB_TOKEN", "")
 GIST_TOKEN    = os.environ.get("GIST_TOKEN")
 GIST_ID_CAL   = os.environ.get("GIST_ID_CALENDAR")
 GIST_ID_MKT   = os.environ.get("GIST_ID_MARKET")
 GIST_ID_HIST  = os.environ.get("GIST_ID_HISTORY")
-FMP_API_KEY   = os.environ.get("FMP_API_KEY", "")
-INTERVAL_SEC  = int(os.environ.get("INTERVAL_SEC", "300"))   # tag only
-RELAY_WORKERS = int(os.environ.get("RELAY_WORKERS", "8"))    # thread pool size
-TIERB_LIMIT   = int(os.environ.get("TIERB_LIMIT", "0"))      # 0 = no cap
-MACRO_TTL_HOURS   = int(os.environ.get("MACRO_TTL_HOURS", "12"))
-MACRO_FORCE_REFRESH = os.environ.get("MACRO_FORCE_REFRESH", "").strip() in ("1","true","True")
-MACRO_WINDOW_DAYS = int(os.environ.get("MACRO_WINDOW_DAYS", "14"))
 
-assert all([TRADIER_TOKEN, TRADIER_BASE, FINNHUB_TOKEN, GIST_TOKEN, GIST_ID_CAL, GIST_ID_MKT, GIST_ID_HIST]), "Missing env vars."
+INTERVAL_SEC      = int(os.environ.get("INTERVAL_SEC", "300"))   # tag only
+RELAY_WORKERS     = int(os.environ.get("RELAY_WORKERS", "8"))    # thread pool size
+TIERB_LIMIT       = int(os.environ.get("TIERB_LIMIT", "0"))      # 0 = no cap
+MACRO_TTL_HOURS   = int(os.environ.get("MACRO_TTL_HOURS", "12"))
+MACRO_FORCE_REFRESH = os.environ.get("MACRO_FORCE_REFRESH", "").strip().lower() in ("1","true","yes")
+MACRO_WINDOW_DAYS = int(os.environ.get("MACRO_WINDOW_DAYS", "21"))  # look-ahead window for macro
+
+assert all([TRADIER_TOKEN, TRADIER_BASE, GIST_TOKEN, GIST_ID_CAL, GIST_ID_MKT, GIST_ID_HIST]), "Missing env vars."
 
 # ── HEADERS / TZ ─────────────────────────────────────────────────────────────
 HDR_TR = {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept":"application/json"}
@@ -49,6 +50,12 @@ def now_utc_iso():
 def to_ist_iso(ts):
     d = dt.datetime.fromisoformat(ts.replace("Z","+00:00")) if isinstance(ts, str) else ts
     return d.astimezone(IST).replace(microsecond=0).isoformat()
+
+def http_get_text(url, headers=None, params=None, timeout=25):
+    r = requests.get(url, headers=headers, params=params, timeout=timeout)
+    r.raise_for_status()
+    r.encoding = r.apparent_encoding or "utf-8"
+    return r.text
 
 def http_get_json(url, headers=None, params=None, timeout=25):
     r = requests.get(url, headers=headers, params=params, timeout=timeout)
@@ -99,10 +106,152 @@ def _dedupe_macro(evts):
         seen.add(key); out.append(e)
     return out
 
-# ── FINNHUB / FMP (macro + earnings) ────────────────────────────────────────
+def _within_window(date_iso, req_from, req_to):
+    try:
+        d = dt.date.fromisoformat(date_iso)
+        return dt.date.fromisoformat(req_from) <= d <= dt.date.fromisoformat(req_to)
+    except Exception:
+        return False
+
+def _to_utc_iso(date_obj, hour=13, minute=30):
+    # default 13:30 UTC for 8:30 ET prints; for FOMC we'll use 18:00 UTC
+    return dt.datetime(date_obj.year, date_obj.month, date_obj.day, hour, minute, tzinfo=UTC).isoformat()
+
+# ── OFFICIAL MACRO FETCHERS (free) ───────────────────────────────────────────
+_MONTHS = "(January|February|March|April|May|June|July|August|September|October|November|December)"
+DATE_RE = re.compile(rf"{_MONTHS}\s+\d{{1,2}},\s+\d{{4}}", re.I)
+
+def _parse_dates_from_html(text):
+    """Extract 'Month DD, YYYY' dates from an HTML page."""
+    text = html.unescape(text)
+    return [m.group(0) for m in DATE_RE.finditer(text)]
+
+def _to_date(s):
+    for fmt in ("%B %d, %Y", "%b %d, %Y"):
+        try: return dt.datetime.strptime(s, fmt).date()
+        except Exception: pass
+    return None
+
+def fetch_bls_cpi(from_date, to_date):
+    # BLS CPI release schedule: https://www.bls.gov/schedule/news_release/cpi.htm
+    url = "https://www.bls.gov/schedule/news_release/cpi.htm"
+    try:
+        txt = http_get_text(url)
+    except Exception:
+        return []
+    dates = []
+    for s in _parse_dates_from_html(txt):
+        d = _to_date(s)
+        if d and _within_window(d.isoformat(), from_date, to_date):
+            dates.append(d)
+    # Deduce uniqueness and map to event with 13:30 UTC default (8:30 ET)
+    out = [{"event":"CPI", "utc_time": _to_utc_iso(d, 13, 30)} for d in sorted(set(dates))]
+    return out
+
+def fetch_bls_nfp(from_date, to_date):
+    # BLS Employment Situation (NFP) schedule: https://www.bls.gov/schedule/news_release/empsit.htm
+    url = "https://www.bls.gov/schedule/news_release/empsit.htm"
+    try:
+        txt = http_get_text(url)
+    except Exception:
+        return []
+    dates = []
+    for s in _parse_dates_from_html(txt):
+        d = _to_date(s)
+        if d and _within_window(d.isoformat(), from_date, to_date):
+            dates.append(d)
+    out = [{"event":"NFP", "utc_time": _to_utc_iso(d, 13, 30)} for d in sorted(set(dates))]
+    return out
+
+def fetch_bea_pce(from_date, to_date):
+    # BEA schedule page contains "Personal Income and Outlays" dates: https://www.bea.gov/news/schedule
+    url = "https://www.bea.gov/news/schedule"
+    try:
+        txt = http_get_text(url)
+    except Exception:
+        return []
+    # Keep only date strings near "Personal Income and Outlays" or "PCE"
+    window_events = []
+    # Quick heuristic: for each match, ensure nearby context mentions "Personal Income"
+    for m in DATE_RE.finditer(txt):
+        start = max(0, m.start()-200)
+        end   = min(len(txt), m.end()+200)
+        ctx   = txt[start:end].lower()
+        if "personal income and outlays" in ctx or "pce" in ctx:
+            d = _to_date(m.group(0))
+            if d and _within_window(d.isoformat(), from_date, to_date):
+                window_events.append(d)
+    out = [{"event":"PCE", "utc_time": _to_utc_iso(d, 13, 30)} for d in sorted(set(window_events))]
+    return out
+
+def fetch_fomc(from_date, to_date):
+    # Fed FOMC calendar page: https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm
+    url = "https://www.federalreserve.gov/monetarypolicy/fomccalendars.htm"
+    try:
+        txt = http_get_text(url)
+    except Exception:
+        return []
+    # FOMC meetings often span two days; statement typically on last day at 2:00 PM ET.
+    # We'll capture all dates on the page and treat those within window as statement day.
+    dates = []
+    for s in _parse_dates_from_html(txt):
+        d = _to_date(s)
+        if d and _within_window(d.isoformat(), from_date, to_date):
+            dates.append(d)
+    # Deduplicate and tag at 18:00 UTC (approx 2:00 PM ET; downstream scanner treats as macro day)
+    out = [{"event":"FOMC", "utc_time": _to_utc_iso(d, 18, 0)} for d in sorted(set(dates))]
+    return out
+
+def fetch_macro_live_official(from_date, to_date):
+    """Aggregate CPI (BLS), NFP (BLS), PCE (BEA), FOMC (Fed) for the window; merge + dedupe."""
+    ev = []
+    ev += fetch_bls_cpi(from_date, to_date)
+    ev += fetch_bls_nfp(from_date, to_date)
+    ev += fetch_bea_pce(from_date, to_date)
+    ev += fetch_fomc(from_date, to_date)
+    return _dedupe_macro(ev)
+
+def fetch_macro_cached(req_from, req_to):
+    """12h macro cache in calendar.json.state.macro_cache. Never wipe a good cache with empties."""
+    prev_cal = gh_get(GIST_ID_CAL, "calendar.json") or {}
+    state    = prev_cal.get("state", {}) if isinstance(prev_cal, dict) else {}
+    cache    = state.get("macro_cache", {}) if isinstance(state, dict) else {}
+
+    cached_events = cache.get("events") or []
+    cached_from   = cache.get("from")
+    cached_to     = cache.get("to")
+    cached_ts     = cache.get("updated_utc")
+
+    covers = cached_events and cached_from and cached_to and _covers_window(cached_from, cached_to, req_from, req_to)
+    fresh  = cached_ts and _age_hours(cached_ts) < MACRO_TTL_HOURS
+
+    if covers and fresh and not MACRO_FORCE_REFRESH:
+        return {"events": cached_events, "source": cache.get("source","cache"), "used_cache": True, "cache": cache}
+
+    # live official fetch
+    evts = fetch_macro_live_official(req_from, req_to)
+    source = "official-aggregate"
+
+    if evts:
+        new_cache = {"from": req_from, "to": req_to, "updated_utc": now_utc_iso(),
+                     "source": source, "events": evts}
+        return {"events": evts, "source": source, "used_cache": False, "cache": new_cache}
+
+    # if live failed, fall back to stale cache (don't clear)
+    if cached_events:
+        return {"events": cached_events, "source": "stale-cache", "used_cache": True, "cache": cache}
+
+    return {"events": [], "source": "none", "used_cache": False, "cache": {}}
+
+# ── FINNHUB EARNINGS (optional) ──────────────────────────────────────────────
 def fetch_earnings(from_date, to_date):
-    j = http_get_json("https://finnhub.io/api/v1/calendar/earnings",
-                      params={"from": from_date, "to": to_date, "token": FINNHUB_TOKEN})
+    if not FINNHUB_TOKEN:
+        return []
+    try:
+        j = http_get_json("https://finnhub.io/api/v1/calendar/earnings",
+                          params={"from": from_date, "to": to_date, "token": FINNHUB_TOKEN})
+    except Exception:
+        return []
     out = []
     for x in (j.get("earningsCalendar") or []):
         sym = (x.get("symbol") or "").upper()
@@ -110,88 +259,6 @@ def fetch_earnings(from_date, to_date):
             when = (x.get("hour") or x.get("time") or "").upper()
             out.append({"symbol": sym, "date": x["date"], "when": when})
     return out
-
-def fetch_macro_live_finnhub(from_date, to_date):
-    try:
-        j = http_get_json("https://finnhub.io/api/v1/calendar/economic",
-                          params={"from": from_date, "to": to_date, "token": FINNHUB_TOKEN})
-        evts=[]
-        for x in (j.get("economicCalendar") or []):
-            name=(x.get("event") or "").upper()
-            if any(k in name for k in ["CPI","PCE","NFP","PAYROLL","FOMC","FED","JOBS"]):
-                ts = x.get("time") or x.get("datetime") or (x.get("date")+"T13:30:00Z" if x.get("date") else None)
-                if ts:
-                    evts.append({"event": name,
-                                 "utc_time": dt.datetime.fromisoformat(ts.replace("Z","+00:00")).replace(microsecond=0).isoformat()})
-        return _dedupe_macro(evts)
-    except Exception:
-        return []
-
-def fetch_macro_live_fmp(from_date, to_date):
-    key = os.environ.get("FMP_API_KEY", "")
-    if not key:
-        return []
-    def _parse_fmp(arr):
-        evts = []
-        for x in (arr or []):
-            name = (x.get("event") or x.get("eventName") or "").upper()
-            if not name:
-                continue
-            if any(k in name for k in ["CPI","CORE CPI","PCE","NON-FARM","PAYROLL","NFP","FOMC","FED","JOBS","UNEMPLOYMENT","ISM","FOMC MINUTES"]):
-                d = x.get("datetime") or x.get("date") or x.get("timestamp") or ""
-                if not d:
-                    continue
-                iso = d if "T" in d else d.replace(" ", "T") + "Z"
-                try:
-                    uts = dt.datetime.fromisoformat(iso.replace("Z","+00:00")).replace(microsecond=0).isoformat()
-                    evts.append({"event": name, "utc_time": uts})
-                except Exception:
-                    continue
-        return _dedupe_macro(evts)
-    try:
-        j4 = http_get_json("https://financialmodelingprep.com/api/v4/economic_calendar",
-                           params={"from": from_date, "to": to_date, "apikey": key})
-        evts = _parse_fmp(j4)
-        if evts: return evts
-    except Exception:
-        pass
-    try:
-        j3 = http_get_json("https://financialmodelingprep.com/api/v3/economic_calendar",
-                           params={"from": from_date, "to": to_date, "apikey": key})
-        return _parse_fmp(j3)
-    except Exception:
-        return []
-
-def fetch_macro_cached(req_from, req_to):
-    prev_cal = gh_get(GIST_ID_CAL, "calendar.json") or {}
-    state    = prev_cal.get("state", {}) if isinstance(prev_cal, dict) else {}
-    cache    = state.get("macro_cache", {}) if isinstance(state, dict) else {}
-    cached_events = cache.get("events") or []
-    cached_from   = cache.get("from")
-    cached_to     = cache.get("to")
-    cached_ts     = cache.get("updated_utc")
-
-    cache_covers = cached_events and cached_from and cached_to and _covers_window(cached_from, cached_to, req_from, req_to)
-    cache_fresh  = cached_ts and _age_hours(cached_ts) < MACRO_TTL_HOURS
-
-    if cache_covers and cache_fresh and not MACRO_FORCE_REFRESH:
-        return {"events": cached_events, "source": cache.get("source","cache"), "used_cache": True, "cache": cache}
-
-    evts = fetch_macro_live_finnhub(req_from, req_to)
-    source="finnhub"
-    if not evts:
-        evts = fetch_macro_live_fmp(req_from, req_to)
-        source="fmp" if evts else "none"
-
-    if evts:
-        new_cache = {"from": req_from, "to": req_to, "updated_utc": now_utc_iso(),
-                     "source": source, "events": evts}
-        return {"events": evts, "source": source, "used_cache": False, "cache": new_cache}
-
-    if cached_events:
-        return {"events": cached_events, "source": "stale-cache", "used_cache": True, "cache": cache}
-
-    return {"events": [], "source": "none", "used_cache": False, "cache": {}}
 
 # ── TRADIER (prices & chains) ────────────────────────────────────────────────
 def quote_underlier(sym):
@@ -268,7 +335,6 @@ def quotes_options(symbols):
         if s and s not in seen:
             seen.add(s)
             if _is_valid_occ(s): syms.append(s)
-
     i = 0
     while i < len(syms):
         # build chunk under URL cap
@@ -281,7 +347,6 @@ def quotes_options(symbols):
                     chunk = [syms[i]]; i += 1
                 break
             chunk.append(syms[i]); i += 1
-
         try:
             out.extend(_fetch_quotes_chunk(chunk))
         except requests.HTTPError as e:
@@ -348,7 +413,7 @@ def spread_pct(bid, ask):
     except Exception:
         return None
 
-# ── Realized comps (from Tradier daily bars + Finnhub dates) ────────────────
+# ── Realized comps (Tradier daily bars + Finnhub dates) ─────────────────────
 def _index_daily_by_date(days):
     idx = {}
     for d in days:
@@ -359,6 +424,8 @@ def _index_daily_by_date(days):
     return idx
 
 def fh_earnings_history(symbol, max_quarters=20):
+    if not FINNHUB_TOKEN:
+        return []
     dates = []
     try:
         j = http_get_json("https://finnhub.io/api/v1/stock/earnings",
@@ -383,6 +450,8 @@ def fh_earnings_history(symbol, max_quarters=20):
     return dates
 
 def fh_when_for_date(symbol, date_str):
+    if not FINNHUB_TOKEN:
+        return ""
     try:
         j = http_get_json("https://finnhub.io/api/v1/calendar/earnings",
                           params={"from": date_str, "to": date_str, "token": FINNHUB_TOKEN})
@@ -395,11 +464,6 @@ def fh_when_for_date(symbol, date_str):
     return ""
 
 def compute_comps(symbol, earn_dates, when_map=None):
-    """
-    For each earnings date:
-      AMC -> gap% = |Open_{D+1} - Close_{D0}| / Close_{D0}; range% = (High_{D+1} - Low_{D+1}) / Close_{D0}
-      BMO -> gap% = |Open_{D0} - Close_{D-1}| / Close_{D-1}; range% = (High_{D0} - Low_{D0}) / Close_{D-1}
-    """
     start = (dt.datetime.now(UTC) - timedelta(days=3*365)).date().isoformat()
     days  = daily_history(symbol, start)
     if not days: return []
@@ -430,6 +494,8 @@ def compute_comps(symbol, earn_dates, when_map=None):
     return out
 
 def build_history_for_symbols(symbols, max_quarters=20):
+    if not FINNHUB_TOKEN:  # no token → skip silently
+        return
     hist = gh_get(GIST_ID_HIST, "history.json") or {"meta":{}, "symbols":{}}
     symmap = hist.setdefault("symbols", {})
     changed = False
@@ -490,12 +556,14 @@ def main():
     from_date = now.date().isoformat()
     to_date   = (now + timedelta(days=14)).date().isoformat()
 
-    # Calendars
+    # Earnings (optional)
     earn  = fetch_earnings(from_date, to_date)
+
+    # Macro (official, cached)
     macro_to = (now + timedelta(days=MACRO_WINDOW_DAYS)).date().isoformat()
     macro_pkg = fetch_macro_cached(from_date, macro_to)
     macro     = macro_pkg["events"]
-    print(f"[relay] macro_source={macro_pkg.get('source')} used_cache={macro_pkg.get('used_cache')} count={len(macro)}")
+    print(f"[relay] macro_source={macro_pkg.get('source')} used_cache={macro_pkg.get('used_cache')} count={len(macro)} window={from_date}..{macro_to}")
 
     # Tier-B symbols; optional cap (keep earliest by date)
     if TIERB_LIMIT and TIERB_LIMIT > 0 and len(earn) > TIERB_LIMIT:
@@ -506,14 +574,14 @@ def main():
     symbols = sorted(set(TIER_A + tierB_syms))
     print(f"[relay] symbols={len(symbols)} tierB={len(tierB_syms)}")
 
-    # Build/refresh realized comps for Tier-B only
-    if tierB_syms:
+    # Build/refresh realized comps for Tier-B only (if FINNHUB_TOKEN present)
+    if tierB_syms and FINNHUB_TOKEN:
         build_history_for_symbols(tierB_syms, max_quarters=20)
 
     # Publish calendar.json (with macro_cache state)
     cal_payload = {
         "meta":  {
-            "source":"finnhub",
+            "source":"official",
             "updated_utc": now_utc_iso(),
             "window_from": from_date,
             "window_to": to_date,
@@ -597,7 +665,7 @@ def main():
                 puts  = sorted([p for p in chain if (p.get("option_type") or "").lower()=="put"],  key=lambda x: abs(float(x.get("strike",0))-spot))
                 pool  = calls[:6] + puts[:6]
 
-                # build symbol->greeks map from chain (ORATS greeks)
+                # symbol->greeks (delta) from chain
                 def fnum(x):
                     try: return float(x)
                     except: return None
@@ -679,6 +747,9 @@ def main():
             if r: results.append(r)
 
     # Aggregate
+    underliers, opt_symbols, sel_meta, chain_metrics = [], [], [], []
+    chain_index_fallback_all = {}
+    wing_selection = {}
     for r in results:
         if r.get("underlier"): underliers.append(r["underlier"])
         if r.get("cm"):        chain_metrics.append(r["cm"])
@@ -703,6 +774,12 @@ def main():
     by_sym = {q.get("symbol"): q for q in qts} if qts else {}
 
     # Build quotes with fallbacks; persist greeks
+    prev_market    = gh_get(GIST_ID_MKT, "market.json") or {}
+    prev_state     = prev_market.get("state", {}) if isinstance(prev_market, dict) else {}
+    prev_last_good = prev_state.get("last_good_quotes", {}) if isinstance(prev_state, dict) else {}
+    prev_ema       = prev_state.get("ema", {}) if isinstance(prev_state, dict) else {}
+    prev_atr       = prev_state.get("atr_cache", {}) if isinstance(prev_state, dict) else {}
+
     last_good = dict(prev_last_good)
     quotes = []
     for m in sel_meta:
@@ -735,7 +812,7 @@ def main():
                 oi  = fb.get("oi")      if oi  is None else oi
                 vol = fb.get("volume")  if vol is None else vol
 
-        # Fill greeks/iv from chain if missing
+        # fill greeks/iv from chain if missing
         fb = chain_index_fallback_all.get(m["contract"])
         if fb:
             iv    = iv    if iv    is not None else fb.get("iv")
@@ -754,7 +831,7 @@ def main():
                 vol = lg.get("volume")  if vol is None else vol
                 ts  = lg.get("quote_time_utc") or ts
 
-        # Update last_good if we now have all core fields
+        # update last_good if we now have all core fields
         if (bid is not None) and (ask is not None) and (oi is not None) and (vol is not None):
             last_good[m["contract"]] = {
                 "bid": float(bid), "ask": float(ask), "oi": int(oi), "volume": int(vol),
