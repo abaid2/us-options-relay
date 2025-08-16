@@ -2,26 +2,22 @@
 # Relay — Tradier options + optional Finnhub earnings
 # Publishes:
 #   - market.json   (underliers + selected option quotes + greeks + chain metrics + EMA + caches + tape-lite)
-#   - history.json  (12–28+ realized earnings comps per symbol; Tier-A equities + Tier-B; only if FINNHUB_TOKEN)
+#   - history.json  (12–28+ realized earnings comps per symbol; Tier-A equities by default; Tier-B optional)
 #   - calendar.json (optional; only if GIST_ID_CALENDAR is set; contains Tier-A and Tier-B earnings list)
 #
-# Free-plan friendly:
-#   • Options/quotes/history/timesales via Tradier brokerage API (no extra fees).
-#   • Finnhub earnings (optional; free key OK, backfills slowly; refresh only when stale).
-#
-# Performance:
-#   • Concurrency (RELAY_WORKERS).
-#   • Chain prefilter (OI+spread) before quotes.
-#   • ±5 strike wings + delta/IV persisted.
-#   • Tape-lite: one timesales call/symbol (5min default) with per-day cache,
-#     explicit time window, last-trading-day fallback, SPX/XSP → SPY proxy, and 1min fallback.
-#   • Typical run < 3 minutes with defaults; 12-minute timeout headroom.
+# Free-plan friendly and resilient:
+#   • Requests use a session with retries/backoff; per-call connect/read timeouts.
+#   • Any per-symbol failure is handled gracefully (symbol skipped; job continues).
+#   • Tape-lite uses explicit time window, last-trading-day & 1min fallback, SPX/XSP→SPY proxy.
+#   • Earnings comps default to Tier-A equities only; Tier-B comps behind a knob.
 
-import os, json, re, urllib.parse
+import os, json, re, urllib.parse, time
 import datetime as dt
 from datetime import timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 # ===== ENV / KNOBS =====
 TRADIER_TOKEN   = os.environ.get("TRADIER_TOKEN")
@@ -43,14 +39,13 @@ TAPE_B_TOPN       = int(os.environ.get("TAPE_B_TOPN","12"))  # tape for top-N Ti
 TAPE_INTERVAL     = os.environ.get("TAPE_INTERVAL","5min")   # "5min" (recommended) or "1min"
 FALLBACK_INTERVAL = os.environ.get("FALLBACK_INTERVAL","1min")
 TAPE_FORCE_REFRESH= os.environ.get("TAPE_FORCE_REFRESH","").lower() in ("1","true","yes")
-
-# Tape proxy for index-like tickers
-TAPE_PROXY = {"SPX": "SPY", "XSP": "SPY"}
+TAPE_PROXY        = {"SPX": "SPY", "XSP": "SPY"}  # index proxies
 
 # History knobs
 MAX_EARNINGS_QTRS      = int(os.environ.get("MAX_EARNINGS_QTRS", "28"))   # ~7 years
 DAILY_LOOKBACK_YEARS   = int(os.environ.get("DAILY_LOOKBACK_YEARS", "8"))
 FORCE_HISTORY_REFRESH  = os.environ.get("FORCE_HISTORY_REFRESH", "").lower() in ("1","true","yes")
+HISTORY_TIERB          = os.environ.get("HISTORY_TIERB","0").lower() in ("1","true","yes")  # default: Tier-A equities only
 
 # Required envs
 assert TRADIER_TOKEN and TRADIER_BASE and GIST_TOKEN and GIST_ID_MARKET and GIST_ID_HISTORY, "Missing env vars."
@@ -68,48 +63,79 @@ TIER_A = [
 # Equities subset for deep comps (skip ETFs/indices)
 TIER_A_EQUITIES = ["TSLA","NVDA","AAPL","MSFT","META","AMD","GOOGL","NFLX","AVGO"]
 
+# ===== RETRYING SESSION =====
+def _build_session():
+    s = requests.Session()
+    retry = Retry(
+        total=3, connect=3, read=3,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET"])
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
+    s.mount("https://", adapter)
+    s.mount("http://",  adapter)
+    return s
+
+SESSION = _build_session()
+CONNECT_TIMEOUT = 6   # quick fail on connect
+READ_TIMEOUT    = 30  # enough time to stream a response
+
 # ===== HELPERS =====
 def now_utc_iso() -> str:
     return dt.datetime.now(UTC).replace(microsecond=0).isoformat()
 
-def http_get_json(url, headers=None, params=None, timeout=30):
-    r = requests.get(url, headers=headers, params=params, timeout=timeout)
-    r.raise_for_status()
-    return r.json()
+def http_get_json(url, headers=None, params=None, timeout=READ_TIMEOUT):
+    try:
+        r = SESSION.get(url, headers=headers, params=params, timeout=(CONNECT_TIMEOUT, timeout))
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        # Bubble up with context (caller catches)
+        raise
 
 def gh_put(gist_id: str, filename: str, obj):
-    url = f"https://api.github.com/gists/{gist_id}"
-    payload = {"files": {filename: {"content": json.dumps(obj, indent=2)}}}
-    r = requests.patch(url, headers=HDR_GH, json=payload, timeout=30)
+    r = SESSION.patch(
+        f"https://api.github.com/gists/{gist_id}",
+        headers=HDR_GH,
+        json={"files": {filename: {"content": json.dumps(obj, indent=2)}}},
+        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
+    )
     r.raise_for_status()
 
 def gh_get(gist_id: str, filename: str):
     try:
         j = http_get_json(f"https://api.github.com/gists/{gist_id}", headers=HDR_GH)
         f = (j.get("files") or {}).get(filename)
-        if not f or "content" not in f:
-            return None
+        if not f or "content" not in f: return None
         return json.loads(f["content"])
     except Exception:
         return None
 
 # ===== TRADIER: quotes / chains / history / timesales =====
 def quote_underlier(sym):
-    j = http_get_json(f"{TRADIER_BASE}/markets/quotes", headers=HDR_TR, params={"symbols": sym})
-    q = (j.get("quotes") or {}).get("quote")
-    if not q: return None
-    if isinstance(q, list): q = q[0]
-    last = q.get("last") or q.get("close")
-    if last is None and q.get("bid") is not None and q.get("ask") is not None:
-        try: last = (float(q["bid"]) + float(q["ask"])) / 2
-        except: last = None
-    return float(last) if last is not None else None
+    try:
+        j = http_get_json(f"{TRADIER_BASE}/markets/quotes", headers=HDR_TR, params={"symbols": sym})
+        q = (j.get("quotes") or {}).get("quote")
+        if not q: return None
+        if isinstance(q, list): q = q[0]
+        last = q.get("last") or q.get("close")
+        if last is None and q.get("bid") is not None and q.get("ask") is not None:
+            try: last = (float(q["bid"]) + float(q["ask"])) / 2
+            except: last = None
+        return float(last) if last is not None else None
+    except Exception:
+        return None
 
 def daily_history(sym, start):
-    j = http_get_json(f"{TRADIER_BASE}/markets/history", headers=HDR_TR,
-                      params={"symbol": sym, "interval": "daily", "start": start})
-    days = (j.get("history") or {}).get("day") or []
-    return [days] if isinstance(days, dict) else days
+    # Wrap in try: callers must not crash the job on network blips
+    try:
+        j = http_get_json(f"{TRADIER_BASE}/markets/history", headers=HDR_TR,
+                          params={"symbol": sym, "interval": "daily", "start": start})
+        days = (j.get("history") or {}).get("day") or []
+        return [days] if isinstance(days, dict) else days
+    except Exception:
+        return []
 
 def atr_from_history(days, period):
     if len(days) < period + 1: return None
@@ -121,17 +147,22 @@ def atr_from_history(days, period):
     return sum(trs[-period:]) / period if len(trs) >= period else None
 
 def expirations(sym):
-    j = http_get_json(f"{TRADIER_BASE}/markets/options/expirations", headers=HDR_TR,
-                      params={"symbol": sym, "includeAllRoots": "true", "strikes": "false"})
-    exps = (j.get("expirations") or {}).get("date") or []
-    return [exps] if isinstance(exps, str) else sorted(exps)
+    try:
+        j = http_get_json(f"{TRADIER_BASE}/markets/options/expirations", headers=HDR_TR,
+                          params={"symbol": sym, "includeAllRoots": "true", "strikes": "false"})
+        exps = (j.get("expirations") or {}).get("date") or []
+        return [exps] if isinstance(exps, str) else sorted(exps)
+    except Exception:
+        return []
 
 def chains(sym, exp):
-    # greeks=true → ORATS greeks + IV on chain rows (hourly-ish), good fallback
-    j = http_get_json(f"{TRADIER_BASE}/markets/options/chains", headers=HDR_TR,
-                      params={"symbol": sym, "expiration": exp, "greeks": "true"})
-    opts = (j.get("options") or {}).get("option") or []
-    return [opts] if isinstance(opts, dict) else opts
+    try:
+        j = http_get_json(f"{TRADIER_BASE}/markets/options/chains", headers=HDR_TR,
+                          params={"symbol": sym, "expiration": exp, "greeks": "true"})
+        opts = (j.get("options") or {}).get("option") or []
+        return [opts] if isinstance(opts, dict) else opts
+    except Exception:
+        return []
 
 # Quotes batching (URL-length aware + binary split + OCC validation)
 _OCC_RE         = re.compile(r'^[A-Z.]{1,6}\d{6}[CP]\d{8}$')
@@ -177,49 +208,44 @@ def quotes_options(symbols):
             chunk.append(syms[i]); i += 1
         try:
             out.extend(_fetch_quotes_chunk(chunk))
-        except requests.HTTPError as e:
-            code = getattr(e.response, "status_code", None)
-            if code in (404, 414):
-                stack = [chunk]
-                while stack:
-                    part = stack.pop()
-                    if len(part) == 1:
-                        try: out.extend(_fetch_quotes_chunk(part))
-                        except requests.HTTPError as e2:
-                            if getattr(e2.response, "status_code", None) in (404,414,400): continue
-                            raise
-                    else:
-                        mid = len(part)//2
-                        stack.append(part[:mid]); stack.append(part[mid:])
-                continue
-            raise
+        except requests.RequestException:
+            # binary split fallback
+            stack = [chunk]
+            while stack:
+                part = stack.pop()
+                if len(part) == 1:
+                    try: out.extend(_fetch_quotes_chunk(part))
+                    except requests.RequestException: pass
+                else:
+                    mid = len(part)//2
+                    stack.append(part[:mid]); stack.append(part[mid:])
     return out
 
 # Timesales (tape-lite) — explicit intraday window + fallback interval
 def timesales(sym, interval="5min", day=None):
     """
-    Fetch intraday bars for a full US session window.
-    Tradier behaves best when start/end include HH:MM.
+    Fetch intraday bars for a full US session window (include HH:MM).
     """
     if day is None:
         day = dt.datetime.now(UTC).date().isoformat()
-    # Full session window; use 00:00..23:59 to also capture AH if provider returns it
     start = f"{day} 00:00"
     end   = f"{day} 23:59"
-    j = http_get_json(
-        f"{TRADIER_BASE}/markets/timesales",
-        headers=HDR_TR,
-        params={"symbol": sym, "interval": interval, "start": start, "end": end, "session_filter": "all"},
-        timeout=30,
-    )
-    rows = (j.get("series", {}) or {}).get("data") or []
-    return [rows] if isinstance(rows, dict) else rows
+    try:
+        j = http_get_json(
+            f"{TRADIER_BASE}/markets/timesales",
+            headers=HDR_TR,
+            params={"symbol": sym, "interval": interval, "start": start, "end": end, "session_filter": "all"},
+            timeout=30,
+        )
+        rows = (j.get("series", {}) or {}).get("data") or []
+        return [rows] if isinstance(rows, dict) else rows
+    except Exception:
+        return []
 
 def compute_vwap(bars):
     num=den=0.0
     for r in bars:
         v = float(r.get("volume") or 0)
-        # prefer 'close'; fall back to 'price' if needed
         p = r.get("close")
         if p is None: p = r.get("price")
         p = float(p or 0)
@@ -319,7 +345,6 @@ def fetch_earnings(from_date, to_date):
     return out
 
 def fh_earnings_history_deep(symbol, years=8):
-    """Backfill earnings dates by sweeping Finnhub calendar year-by-year."""
     if not FINNHUB_TOKEN: return []
     today = dt.date.today()
     start_year = today.year - max(1, int(years))
@@ -355,27 +380,29 @@ def fh_earnings_history(symbol, max_quarters=MAX_EARNINGS_QTRS):
     return dates[:max_quarters]
 
 def compute_comps(symbol, earn_dates):
-    # gap% + D/D+1 range%, using Tradier daily bars (long lookback)
-    start = (dt.datetime.now(UTC) - timedelta(days=DAILY_LOOKBACK_YEARS*365)).date().isoformat()
-    days  = daily_history(symbol, start)
-    if not days: return []
-    idx = {str(d["date"]): {"o": float(d["open"]), "h": float(d["high"]), "l": float(d["low"]), "c": float(d["close"])} for d in days}
-    out = []
-    for d in earn_dates:
-        d0 = dt.date.fromisoformat(d)
-        d_1 = next(((d0 - timedelta(days=k)).isoformat() for k in range(1,4) if (d0 - timedelta(days=k)).isoformat() in idx), None)
-        d1  = next(((d0 + timedelta(days=k)).isoformat() for k in range(1,4) if (d0 + timedelta(days=k)).isoformat() in idx), None)
-        bar_d0 = idx.get(d)
-        if not bar_d0: continue
-        if d_1:
-            c_1 = idx[d_1]["c"]; o0 = bar_d0["o"]; h0 = bar_d0["h"]; l0 = bar_d0["l"]
-            gap = abs(o0 - c_1)/c_1; rng = (h0 - l0)/c_1
-            out.append({"date": d, "when": "BMO", "gap_pct": round(gap,6), "range_pct": round(rng,6)})
-        elif d1:
-            c0 = bar_d0["c"]; o1 = idx[d1]["o"]; h1 = idx[d1]["h"]; l1 = idx[d1]["l"]
-            gap = abs(o1 - c0)/c0; rng = (h1 - l1)/c0
-            out.append({"date": d, "when": "AMC", "gap_pct": round(gap,6), "range_pct": round(rng,6)})
-    return out
+    try:
+        start = (dt.datetime.now(UTC) - timedelta(days=DAILY_LOOKBACK_YEARS*365)).date().isoformat()
+        days  = daily_history(symbol, start)
+        if not days: return []
+        idx = {str(d["date"]): {"o": float(d["open"]), "h": float(d["high"]), "l": float(d["low"]), "c": float(d["close"])} for d in days}
+        out = []
+        for d in earn_dates:
+            d0 = dt.date.fromisoformat(d)
+            d_1 = next(((d0 - timedelta(days=k)).isoformat() for k in range(1,4) if (d0 - timedelta(days=k)).isoformat() in idx), None)
+            d1  = next(((d0 + timedelta(days=k)).isoformat() for k in range(1,4) if (d0 + timedelta(days=k)).isoformat() in idx), None)
+            bar_d0 = idx.get(d)
+            if not bar_d0: continue
+            if d_1:
+                c_1 = idx[d_1]["c"]; o0 = bar_d0["o"]; h0 = bar_d0["h"]; l0 = bar_d0["l"]
+                gap = abs(o0 - c_1)/c_1; rng = (h0 - l0)/c_1
+                out.append({"date": d, "when": "BMO", "gap_pct": round(gap,6), "range_pct": round(rng,6)})
+            elif d1:
+                c0 = bar_d0["c"]; o1 = idx[d1]["o"]; h1 = idx[d1]["h"]; l1 = idx[d1]["l"]
+                gap = abs(o1 - c0)/c0; rng = (h1 - l1)/c0
+                out.append({"date": d, "when": "AMC", "gap_pct": round(gap,6), "range_pct": round(rng,6)})
+        return out
+    except Exception:
+        return []
 
 # ===== MAIN =====
 def main():
@@ -383,7 +410,7 @@ def main():
     from_date = now.date().isoformat()
     to_date   = (now + timedelta(days=14)).date().isoformat()
 
-    # Optional earnings → Tier-B
+    # Optional earnings → Tier-B (list only; history handled separately)
     earn = fetch_earnings(from_date, to_date) if FINNHUB_TOKEN else []
     if TIERB_LIMIT and TIERB_LIMIT > 0 and len(earn) > TIERB_LIMIT:
         earn = sorted(earn, key=lambda x: x["date"])[:TIERB_LIMIT]
@@ -391,9 +418,9 @@ def main():
     symbols    = sorted(set(TIER_A + tierB_syms))
     print(f"[relay] symbols={len(symbols)} tierB={len(tierB_syms)}")
 
-    # Optional history.json (Tier-A equities + Tier-B; only if FINNHUB_TOKEN)
+    # Optional history.json (Tier-A equities always; Tier-B only if HISTORY_TIERB=1)
     if FINNHUB_TOKEN:
-        candidates = sorted(set(TIER_A_EQUITIES + list(tierB_syms)))
+        candidates = sorted(set(TIER_A_EQUITIES + (list(tierB_syms) if HISTORY_TIERB else [])))
         hist = gh_get(GIST_ID_HISTORY, "history.json") or {"meta":{}, "symbols":{}}
         symmap, changed = hist.setdefault("symbols", {}), False
         for s in candidates:
@@ -551,7 +578,6 @@ def main():
         bid = q.get("bid"); ask = q.get("ask"); last = q.get("last")
         oi  = q.get("open_interest"); vol = q.get("volume")
 
-        # greeks
         def f(x):
             try: return float(x)
             except: return None
@@ -564,7 +590,6 @@ def main():
             theta = f(g.get("theta")); vega  = f(g.get("vega"))
         ts  = q.get("trade_date") or q.get("updated") or now_utc_iso()
 
-        # fallbacks (chain -> last_good)
         fb = chain_fallback_all.get(m["contract"])
         if (bid is None) or (ask is None) or (oi is None) or (vol is None):
             if fb:
@@ -622,7 +647,6 @@ def main():
     today_iso = now.date().isoformat()
 
     def last_trading_day(sym):
-        # Use the last completed daily bar as the 'session' date
         days = daily_history(sym, (now - timedelta(days=10)).date().isoformat())
         if not days or len(days) < 2:
             return today_iso
@@ -653,7 +677,6 @@ def main():
         except Exception:
             pass
 
-        # decide if we compute intraday tape for this symbol
         allow_tierb = (not TAPE_TIERA_ONLY) and ( (u in tierb_tape_whitelist) or (u in TIER_A) )
         if (u in TIER_A) or allow_tierb:
             session = today_iso
@@ -663,9 +686,7 @@ def main():
                 bars = _load_bars(u, session)
             if not bars and u in TAPE_PROXY:
                 proxy = TAPE_PROXY[u]
-                bars = _load_bars(proxy, today_iso)
-                if not bars:
-                    bars = _load_bars(proxy, last_trading_day(proxy))
+                bars = _load_bars(proxy, today_iso) or _load_bars(proxy, last_trading_day(proxy))
                 tape["proxy"] = proxy
 
             if bars:
