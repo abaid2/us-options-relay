@@ -7,13 +7,14 @@
 #
 # Free-plan friendly:
 #   • Options/quotes/history/timesales via Tradier brokerage API (no extra fees).
-#   • Finnhub earnings (optional; free key OK, we backfill slowly and refresh only when stale).
+#   • Finnhub earnings (optional; free key OK, backfills slowly; refresh only when stale).
 #
 # Performance:
 #   • Concurrency (RELAY_WORKERS).
 #   • Chain prefilter (OI+spread) before quotes.
 #   • ±5 strike wings + delta/IV persisted.
-#   • Tape-lite: one timesales call/symbol (5min default) with per-day cache and last-trading-day fallback (+ proxy for SPX/XSP).
+#   • Tape-lite: one timesales call/symbol (5min default) with per-day cache,
+#     explicit time window, last-trading-day fallback, SPX/XSP → SPY proxy, and 1min fallback.
 #   • Typical run < 3 minutes with defaults; 12-minute timeout headroom.
 
 import os, json, re, urllib.parse
@@ -37,18 +38,19 @@ RELAY_WORKERS    = int(os.environ.get("RELAY_WORKERS",  "8"))
 TIERB_LIMIT      = int(os.environ.get("TIERB_LIMIT",    "40"))    # 0 = no cap
 
 # Tape knobs
-TAPE_TIERA_ONLY  = os.environ.get("TAPE_TIERA_ONLY","1").lower() in ("1","true","yes")  # 1 = tape only Tier-A
-TAPE_B_TOPN      = int(os.environ.get("TAPE_B_TOPN","12"))  # tape for top-N Tier-B by chain OI; 0 = all Tier-B
-TAPE_INTERVAL    = os.environ.get("TAPE_INTERVAL","5min")   # "5min" (recommended) or "1min"
-FALLBACK_INTERVAL= os.environ.get("FALLBACK_INTERVAL","1min")
+TAPE_TIERA_ONLY   = os.environ.get("TAPE_TIERA_ONLY","1").lower() in ("1","true","yes")  # 1 = tape only Tier-A
+TAPE_B_TOPN       = int(os.environ.get("TAPE_B_TOPN","12"))  # tape for top-N Tier-B by chain OI; 0 = all Tier-B
+TAPE_INTERVAL     = os.environ.get("TAPE_INTERVAL","5min")   # "5min" (recommended) or "1min"
+FALLBACK_INTERVAL = os.environ.get("FALLBACK_INTERVAL","1min")
+TAPE_FORCE_REFRESH= os.environ.get("TAPE_FORCE_REFRESH","").lower() in ("1","true","yes")
+
+# Tape proxy for index-like tickers
+TAPE_PROXY = {"SPX": "SPY", "XSP": "SPY"}
 
 # History knobs
 MAX_EARNINGS_QTRS      = int(os.environ.get("MAX_EARNINGS_QTRS", "28"))   # ~7 years
 DAILY_LOOKBACK_YEARS   = int(os.environ.get("DAILY_LOOKBACK_YEARS", "8"))
 FORCE_HISTORY_REFRESH  = os.environ.get("FORCE_HISTORY_REFRESH", "").lower() in ("1","true","yes")
-
-# Tape proxy for index-like tickers
-TAPE_PROXY = {"SPX": "SPY", "XSP": "SPY"}
 
 # Required envs
 assert TRADIER_TOKEN and TRADIER_BASE and GIST_TOKEN and GIST_ID_MARKET and GIST_ID_HISTORY, "Missing env vars."
@@ -196,17 +198,19 @@ def quotes_options(symbols):
 # Timesales (tape-lite) — explicit intraday window + fallback interval
 def timesales(sym, interval="5min", day=None):
     """
-    Fetch intraday bars for a full session window.
-    Tradier expects 'start' and 'end' with HH:MM; otherwise it can return zero rows.
+    Fetch intraday bars for a full US session window.
+    Tradier behaves best when start/end include HH:MM.
     """
     if day is None:
         day = dt.datetime.now(UTC).date().isoformat()
+    # Full session window; use 00:00..23:59 to also capture AH if provider returns it
     start = f"{day} 00:00"
     end   = f"{day} 23:59"
     j = http_get_json(
         f"{TRADIER_BASE}/markets/timesales",
         headers=HDR_TR,
-        params={"symbol": sym, "interval": interval, "start": start, "end": end, "session_filter": "all"}
+        params={"symbol": sym, "interval": interval, "start": start, "end": end, "session_filter": "all"},
+        timeout=30,
     )
     rows = (j.get("series", {}) or {}).get("data") or []
     return [rows] if isinstance(rows, dict) else rows
@@ -214,7 +218,11 @@ def timesales(sym, interval="5min", day=None):
 def compute_vwap(bars):
     num=den=0.0
     for r in bars:
-        v = float(r.get("volume") or 0); p = float(r.get("close") or 0)
+        v = float(r.get("volume") or 0)
+        # prefer 'close'; fall back to 'price' if needed
+        p = r.get("close")
+        if p is None: p = r.get("price")
+        p = float(p or 0)
         num += v*p; den += v
     return (num/den) if den>0 else None
 
@@ -253,7 +261,7 @@ def pick_targets(chain_rows, spot, how_many=5):
         cs = float(c.get("strike", 0))
         if not puts: break
         pm = min(puts[:how_many*3], key=lambda p: abs(float(p.get("strike", 0)) - cs))
-        d  = abs(cs - spot) + abs(float(pm.get("strike", 0)) - spot)
+        d  = abs(cs - spot) + abs(float(pm.get("strike", 0)) - cs)
         if pm and d < bestd:
             bestd, best = d, (c, pm)
     wings = []
@@ -608,7 +616,7 @@ def main():
         prev_val = (prev_ema_map.get(sym) or {}).get("ema30") if isinstance(prev_ema_map.get(sym), dict) else None
         ema_out[sym] = {"ema30": ema_update(prev_val, x, alpha=0.15), "last_date": now.date().isoformat()}
 
-    # === Tape-lite with per-day cache + last-trading-day + proxy fallback ===
+    # === Tape-lite with per-day cache + explicit window + last-trading-day + proxy fallback ===
     prev_tape = prev_tape if isinstance(prev_tape, dict) else {}
     tape_state = {}
     today_iso = now.date().isoformat()
@@ -629,7 +637,9 @@ def main():
 
     def build_tape_for(u):
         cached = prev_tape.get(u)
-        if isinstance(cached, dict) and cached.get("asof") == today_iso:
+        # Only keep cache if it's for today AND already enriched (has vwap or rsi5) unless forced
+        if not TAPE_FORCE_REFRESH and isinstance(cached, dict) and cached.get("asof") == today_iso \
+           and (cached.get("vwap") is not None or cached.get("rsi5") is not None):
             return cached
 
         tape = {"asof": today_iso}
@@ -648,11 +658,9 @@ def main():
         if (u in TIER_A) or allow_tierb:
             session = today_iso
             bars = _load_bars(u, session)
-
             if not bars:
                 session = last_trading_day(u)
                 bars = _load_bars(u, session)
-
             if not bars and u in TAPE_PROXY:
                 proxy = TAPE_PROXY[u]
                 bars = _load_bars(proxy, today_iso)
@@ -661,9 +669,11 @@ def main():
                 tape["proxy"] = proxy
 
             if bars:
-                closes = [float(r["close"]) for r in bars if r.get("close") is not None]
+                # prefer 'close'; fallback to 'price'
+                closes = [float((r.get("close") if r.get("close") is not None else r.get("price") or 0))
+                          for r in bars if (r.get("close") is not None or r.get("price") is not None)]
                 tape["session_date"] = session
-                tape["open"] = float(bars[0]["open"]) if bars[0].get("open") is not None else tape.get("open")
+                tape["open"] = float(bars[0].get("open")) if bars[0].get("open") is not None else tape.get("open")
                 tape["vwap"] = compute_vwap(bars)
                 tape["rsi5"] = rsi(closes, 5)
                 vols = [int(r.get("volume") or 0) for r in bars]
