@@ -1,11 +1,20 @@
 #!/usr/bin/env python3
-# Clean relay — Tradier options + optional Finnhub earnings
+# Relay — Tradier options + optional Finnhub earnings
 # Publishes:
 #   - market.json   (underliers + selected option quotes + greeks + chain metrics + EMA + caches + tape-lite)
-#   - history.json  (12–20 realized earnings comps per symbol; Tier-A + Tier-B; only if FINNHUB_TOKEN)
+#   - history.json  (12–28+ realized earnings comps per symbol; Tier-A equities + Tier-B; only if FINNHUB_TOKEN)
 #   - calendar.json (optional; only if GIST_ID_CALENDAR is set; contains Tier-A and Tier-B earnings list)
 #
-# Design goals: fast, robust, minimal external dependencies.
+# Free-plan friendly:
+#   • Options/quotes/history/timesales via Tradier brokerage API (no extra fees).
+#   • Finnhub earnings (optional; free key OK, we backfill slowly and refresh only when stale).
+#
+# Performance:
+#   • Concurrency (RELAY_WORKERS).
+#   • Chain prefilter (OI+spread) before quotes.
+#   • ±5 strike wings + delta/IV persisted.
+#   • Tape-lite: one timesales call/symbol (5min default) with per-day cache.
+#   • Typical run < 3 minutes with defaults; 12-minute timeout headroom.
 
 import os, json, re, urllib.parse
 import datetime as dt
@@ -13,36 +22,47 @@ from datetime import timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
-# ── ENV ──────────────────────────────────────────────────────────────────────
+# ===== ENV / KNOBS =====
 TRADIER_TOKEN   = os.environ.get("TRADIER_TOKEN")
 TRADIER_BASE    = os.environ.get("TRADIER_BASE", "https://api.tradier.com/v1")
-FINNHUB_TOKEN   = os.environ.get("FINNHUB_TOKEN", "")  # optional (for earnings/history)
+FINNHUB_TOKEN   = os.environ.get("FINNHUB_TOKEN", "")  # optional
 GIST_TOKEN      = os.environ.get("GIST_TOKEN")
 GIST_ID_MARKET  = os.environ.get("GIST_ID_MARKET")
 GIST_ID_HISTORY = os.environ.get("GIST_ID_HISTORY")
-GIST_ID_CAL     = os.environ.get("GIST_ID_CALENDAR", "")  # optional; empty = skip calendar.json
+GIST_ID_CAL     = os.environ.get("GIST_ID_CALENDAR", "")  # optional; empty = skip
 
 # Tuning
-INTERVAL_SEC     = int(os.environ.get("INTERVAL_SEC",   "300"))  # meta tag only
+INTERVAL_SEC     = int(os.environ.get("INTERVAL_SEC",   "300"))   # meta tag only
 RELAY_WORKERS    = int(os.environ.get("RELAY_WORKERS",  "8"))
-TIERB_LIMIT      = int(os.environ.get("TIERB_LIMIT",    "40"))   # cap Tier-B to lighten load (0 = no cap)
-TAPE_TIERA_ONLY  = os.environ.get("TAPE_TIERA_ONLY","1").lower() in ("1","true","yes")  # compute tape-lite only for Tier-A
+TIERB_LIMIT      = int(os.environ.get("TIERB_LIMIT",    "40"))    # 0 = no cap
+
+# Tape knobs
+TAPE_TIERA_ONLY  = os.environ.get("TAPE_TIERA_ONLY","1").lower() in ("1","true","yes")  # 1 = tape only Tier-A
+TAPE_B_TOPN      = int(os.environ.get("TAPE_B_TOPN","12"))  # tape for top-N Tier-B by chain OI; 0 = all Tier-B
+TAPE_INTERVAL    = os.environ.get("TAPE_INTERVAL","5min")   # "5min" (recommended) or "1min"
+
+# History knobs
+MAX_EARNINGS_QTRS      = int(os.environ.get("MAX_EARNINGS_QTRS", "28"))   # ~7 years
+DAILY_LOOKBACK_YEARS   = int(os.environ.get("DAILY_LOOKBACK_YEARS", "8"))
+FORCE_HISTORY_REFRESH  = os.environ.get("FORCE_HISTORY_REFRESH", "").lower() in ("1","true","yes")
 
 # Required envs
 assert TRADIER_TOKEN and TRADIER_BASE and GIST_TOKEN and GIST_ID_MARKET and GIST_ID_HISTORY, "Missing env vars."
 
-# ── HEADERS / TZ ─────────────────────────────────────────────────────────────
+# ===== HEADERS / TZ =====
 HDR_TR = {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"}
 HDR_GH = {"Authorization": f"Bearer {GIST_TOKEN}",    "Accept": "application/vnd.github+json"}
 UTC    = timezone.utc
 
-# ── UNIVERSE ─────────────────────────────────────────────────────────────────
+# ===== UNIVERSE =====
 TIER_A = [
     "SPX","XSP","SPY","QQQ","TSLA","NVDA","AAPL","MSFT","META",
     "AMD","GOOGL","NFLX","AVGO","IWM","SMH","XBI","TLT","GDX"
 ]
+# Equities subset for deep comps (skip ETFs/indices)
+TIER_A_EQUITIES = ["TSLA","NVDA","AAPL","MSFT","META","AMD","GOOGL","NFLX","AVGO"]
 
-# ── HELPERS ──────────────────────────────────────────────────────────────────
+# ===== HELPERS =====
 def now_utc_iso() -> str:
     return dt.datetime.now(UTC).replace(microsecond=0).isoformat()
 
@@ -67,7 +87,7 @@ def gh_get(gist_id: str, filename: str):
     except Exception:
         return None
 
-# ── TRADIER (prices & chains) ────────────────────────────────────────────────
+# ===== TRADIER: quotes / chains / history / timesales =====
 def quote_underlier(sym):
     j = http_get_json(f"{TRADIER_BASE}/markets/quotes", headers=HDR_TR, params={"symbols": sym})
     q = (j.get("quotes") or {}).get("quote")
@@ -134,7 +154,6 @@ def _fetch_quotes_chunk(chunk_syms):
 def quotes_options(symbols):
     out = []
     if not symbols: return out
-    # de-dup & validate
     seen, syms = set(), []
     for s in symbols:
         if s and s not in seen:
@@ -171,7 +190,7 @@ def quotes_options(symbols):
     return out
 
 # Timesales (tape-lite)
-def timesales(sym, interval="1min", day=None):
+def timesales(sym, interval="5min", day=None):
     if day is None:
         day = dt.datetime.now(UTC).date().isoformat()
     j = http_get_json(f"{TRADIER_BASE}/markets/timesales", headers=HDR_TR,
@@ -179,7 +198,7 @@ def timesales(sym, interval="1min", day=None):
     rows = (j.get("series",{}) or {}).get("data") or []
     return [rows] if isinstance(rows, dict) else rows
 
-def compute_vwap_1min(bars):
+def compute_vwap(bars):
     num=den=0.0
     for r in bars:
         v = float(r.get("volume") or 0); p = float(r.get("close") or 0)
@@ -191,13 +210,12 @@ def rsi(values, n=5):
     gains=losses=0.0
     for i in range(-n,0):
         ch = values[i] - values[i-1]
-        if ch>=0: gains += ch
-        else:     losses -= ch
+        gains += max(ch,0); losses += max(-ch,0)
     if losses == 0: return 100.0
     rs = (gains/n)/(losses/n)
     return 100 - 100/(1+rs)
 
-# ── Selection & metrics ──────────────────────────────────────────────────────
+# ===== Selection & metrics =====
 def nearest_friday_on_or_after(date_str):
     y, m, d = map(int, date_str.split("-"))
     base = dt.date(y, m, d)
@@ -263,7 +281,7 @@ def chain_metrics_from_chain(chain_rows):
 def ema_update(prev, x, alpha=0.15):
     return x if prev is None else (alpha*x + (1-alpha)*prev)
 
-# ── FINNHUB (optional earnings & history) ────────────────────────────────────
+# ===== FINNHUB (optional earnings & history) =====
 def fetch_earnings(from_date, to_date):
     if not FINNHUB_TOKEN: return []
     try:
@@ -279,7 +297,26 @@ def fetch_earnings(from_date, to_date):
             out.append({"symbol": sym, "date": x["date"], "when": when})
     return out
 
-def fh_earnings_history(symbol, max_quarters=20):
+def fh_earnings_history_deep(symbol, years=8):
+    """Backfill earnings dates by sweeping Finnhub calendar year-by-year."""
+    if not FINNHUB_TOKEN: return []
+    today = dt.date.today()
+    start_year = today.year - max(1, int(years))
+    dates = set()
+    for yr in range(start_year, today.year + 1):
+        try:
+            y1 = dt.date(yr, 1, 1).isoformat()
+            y2 = dt.date(yr, 12, 31).isoformat()
+            j  = http_get_json("https://finnhub.io/api/v1/calendar/earnings",
+                               params={"from": y1, "to": y2, "token": FINNHUB_TOKEN})
+            for x in (j.get("earningsCalendar") or []):
+                if (x.get("symbol") or "").upper() == symbol and x.get("date"):
+                    dates.add(x["date"])
+        except Exception:
+            continue
+    return sorted(dates, reverse=True)
+
+def fh_earnings_history(symbol, max_quarters=MAX_EARNINGS_QTRS):
     if not FINNHUB_TOKEN: return []
     dates = []
     try:
@@ -290,48 +327,36 @@ def fh_earnings_history(symbol, max_quarters=20):
             if d: dates.append(str(d)[:10])
     except Exception:
         dates = []
-    dates = sorted(set(dates), reverse=True)[:max_quarters]
-    if not dates:
-        try:
-            end   = dt.datetime.now(UTC).date()
-            start = (end - timedelta(days=3*365))
-            j = http_get_json("https://finnhub.io/api/v1/calendar/earnings",
-                              params={"from": start.isoformat(), "to": end.isoformat(), "token": FINNHUB_TOKEN})
-            for x in (j.get("earningsCalendar") or []):
-                if (x.get("symbol") or "").upper() == symbol and x.get("date"):
-                    dates.append(x["date"])
-        except Exception:
-            pass
-    return sorted(set(dates), reverse=True)[:max_quarters]
+    dates = sorted(set(dates), reverse=True)
+    if len(dates) < max_quarters:
+        sweep = fh_earnings_history_deep(symbol, years=max(DAILY_LOOKBACK_YEARS, 8))
+        dates = sorted(set(dates).union(sweep), reverse=True)
+    return dates[:max_quarters]
 
 def compute_comps(symbol, earn_dates):
-    # gap% + D/D+1 range%, using Tradier daily bars
-    start = (dt.datetime.now(UTC) - timedelta(days=3*365)).date().isoformat()
+    # gap% + D/D+1 range%, using Tradier daily bars (long lookback)
+    start = (dt.datetime.now(UTC) - timedelta(days=DAILY_LOOKBACK_YEARS*365)).date().isoformat()
     days  = daily_history(symbol, start)
     if not days: return []
     idx = {str(d["date"]): {"o": float(d["open"]), "h": float(d["high"]), "l": float(d["low"]), "c": float(d["close"])} for d in days}
     out = []
     for d in earn_dates:
         d0 = dt.date.fromisoformat(d)
-        # nearest trading D-1 and D+1
         d_1 = next(( (d0 - timedelta(days=k)).isoformat() for k in range(1,4) if (d0 - timedelta(days=k)).isoformat() in idx ), None)
         d1  = next(( (d0 + timedelta(days=k)).isoformat() for k in range(1,4) if (d0 + timedelta(days=k)).isoformat() in idx ), None)
         bar_d0 = idx.get(d)
         if not bar_d0: continue
-        # assume BMO if unknown
         if d_1:
             c_1 = idx[d_1]["c"]; o0 = bar_d0["o"]; h0 = bar_d0["h"]; l0 = bar_d0["l"]
-            gap = abs(o0 - c_1)/c_1
-            rng = (h0 - l0)/c_1
+            gap = abs(o0 - c_1)/c_1; rng = (h0 - l0)/c_1
             out.append({"date": d, "when": "BMO", "gap_pct": round(gap,6), "range_pct": round(rng,6)})
         elif d1:
             c0 = bar_d0["c"]; o1 = idx[d1]["o"]; h1 = idx[d1]["h"]; l1 = idx[d1]["l"]
-            gap = abs(o1 - c0)/c0
-            rng = (h1 - l1)/c0
+            gap = abs(o1 - c0)/c0; rng = (h1 - l1)/c0
             out.append({"date": d, "when": "AMC", "gap_pct": round(gap,6), "range_pct": round(rng,6)})
     return out
 
-# ── MAIN ─────────────────────────────────────────────────────────────────────
+# ===== MAIN =====
 def main():
     now       = dt.datetime.now(UTC)
     from_date = now.date().isoformat()
@@ -345,33 +370,35 @@ def main():
     symbols    = sorted(set(TIER_A + tierB_syms))
     print(f"[relay] symbols={len(symbols)} tierB={len(tierB_syms)}")
 
-    # Optional history.json (Tier-A + Tier-B; only if FINNHUB_TOKEN)
+    # Optional history.json (Tier-A equities + Tier-B; only if FINNHUB_TOKEN)
     if FINNHUB_TOKEN:
-        # ETFs/indices will naturally skip (Finnhub returns no history)
-        candidates = sorted(set([s for s in TIER_A if s.isalpha()] + list(tierB_syms)))
+        candidates = sorted(set(TIER_A_EQUITIES + list(tierB_syms)))
         hist = gh_get(GIST_ID_HISTORY, "history.json") or {"meta":{}, "symbols":{}}
         symmap, changed = hist.setdefault("symbols", {}), False
         for s in candidates:
             last_ts = (symmap.get(s) or {}).get("_updated_utc")
             stale = True
-            if last_ts:
+            if last_ts and not FORCE_HISTORY_REFRESH:
                 try:
                     dt_last = dt.datetime.fromisoformat(last_ts.replace("Z","+00:00"))
                     stale = (now - dt_last).days >= 7
                 except Exception:
                     stale = True
-            if not stale: continue
-            dates = fh_earnings_history(s, max_quarters=20)
+            enough = len((symmap.get(s) or {}).get("comps", [])) >= 12
+            if not stale and enough: continue
+
+            dates = fh_earnings_history(s, max_quarters=MAX_EARNINGS_QTRS)
             if not dates: continue
             comps = compute_comps(s, dates)
+            comps = [c for c in comps if isinstance(c.get("gap_pct"), (int,float)) and isinstance(c.get("range_pct"), (int,float))]
             if comps:
-                symmap[s] = {"_updated_utc": now_utc_iso(), "comps": comps}
+                symmap[s] = {"_updated_utc": now_utc_iso(), "comps": comps[:MAX_EARNINGS_QTRS]}
                 changed = True
         if changed:
-            hist["meta"] = {"updated_utc": now_utc_iso(), "lookback_years": 3}
+            hist["meta"] = {"updated_utc": now_utc_iso(), "lookback_years": DAILY_LOOKBACK_YEARS}
             gh_put(GIST_ID_HISTORY, "history.json", hist)
 
-    # Optional calendar.json (if GIST_ID_CAL present)
+    # Optional calendar.json (Tier-A + Tier-B summary)
     if GIST_ID_CAL:
         cal_payload = {
             "meta":  {"source": "finnhub" if FINNHUB_TOKEN else "none",
@@ -382,7 +409,7 @@ def main():
         }
         gh_put(GIST_ID_CAL, "calendar.json", cal_payload)
 
-    # Load previous market state (EMA, last_good, ATR cache, tape)
+    # Load previous market state
     prev_market    = gh_get(GIST_ID_MARKET, "market.json") or {}
     prev_state     = prev_market.get("state", {}) if isinstance(prev_market, dict) else {}
     prev_ema       = prev_state.get("ema", {}) if isinstance(prev_state, dict) else {}
@@ -414,34 +441,11 @@ def main():
                 atr14 = atr_from_history(days[-80:],14) if days else None
                 atr_updates[u] = {"asof": now.date().isoformat(), "atr5": atr5, "atr14": atr14}
 
-            # Tape-lite (Tier-A only by default)
-            tape = prev_tape.get(u, {}).copy() if isinstance(prev_tape.get(u), dict) else {}
-            try:
-                prev_days = daily_history(u, (now - timedelta(days=10)).date().isoformat())
-                if prev_days and len(prev_days) >= 2:
-                    pd = prev_days[-2]
-                    tape["prev_high"] = float(pd["high"])
-                    tape["prev_low"]  = float(pd["low"])
-                if (not TAPE_TIERA_ONLY) or (u in TIER_A):
-                    bars1 = timesales(u, "1min")
-                    if bars1:
-                        closes = [float(r["close"]) for r in bars1 if r.get("close") is not None]
-                        tape["open"] = float(bars1[0]["open"]) if bars1 and bars1[0].get("open") is not None else tape.get("open")
-                        tape["vwap"] = compute_vwap_1min(bars1)
-                        tape["rsi5"] = rsi(closes, 5)
-                    bars5 = timesales(u, "5min")
-                    if bars5:
-                        vols5 = [int(r.get("volume") or 0) for r in bars5]
-                        tape["vol5m_now"]    = vols5[-1] if vols5 else tape.get("vol5m_now")
-                        tape["vol5m_median"] = sorted(vols5)[len(vols5)//2] if vols5 else tape.get("vol5m_median")
-            except Exception:
-                pass
-
-            # pick expiry
+            # expiry
             e_dates = [x["date"] for x in earn if x["symbol"] == u]
             desired = nearest_friday_on_or_after(e_dates[0]) if e_dates else nearest_friday_on_or_after((now + timedelta(days=7)).date().isoformat())
             expiry  = pick_expiration(u, desired)
-            under = {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso(), "tape": tape}
+            under = {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()}
             if not expiry:
                 return {"underlier": under}
 
@@ -491,8 +495,6 @@ def main():
         except Exception:
             return None
 
-    # Run workers in parallel
-    chain_fallback_all = {}
     results = []
     with ThreadPoolExecutor(max_workers=RELAY_WORKERS) as ex:
         futs = {ex.submit(process_symbol, u): u for u in symbols}
@@ -510,6 +512,11 @@ def main():
             sel_meta.extend(r["sel"])
             opt_symbols.extend([s["contract"] for s in r["sel"]])
         if r.get("fallback"):  chain_fallback_all.update(r["fallback"])
+
+    # Determine Tier-B tape whitelist (top-N by chain OI after prefilter)
+    tierb_chain = [cm for cm in chain_metrics if cm["u"] in tierB_syms]
+    tierb_chain.sort(key=lambda x: x.get("chain_oi_total",0), reverse=True)
+    tierb_tape_whitelist = set(cm["u"] for cm in tierb_chain[:max(0, TAPE_B_TOPN)]) if TAPE_B_TOPN else set(tierB_syms)
 
     # Quotes for selected legs
     qts   = quotes_options(opt_symbols)
@@ -536,7 +543,7 @@ def main():
             theta = f(g.get("theta")); vega  = f(g.get("vega"))
         ts  = q.get("trade_date") or q.get("updated") or now_utc_iso()
 
-        # fallbacks
+        # fallbacks (chain -> last_good)
         fb = chain_fallback_all.get(m["contract"])
         if (bid is None) or (ask is None) or (oi is None) or (vol is None):
             if fb:
@@ -582,17 +589,53 @@ def main():
 
     # EMA (30-day proxy via EMA of today's chain notional)
     ema_out = {}
+    prev_ema_map = prev_ema if isinstance(prev_ema, dict) else {}
     for cm in chain_metrics:
         sym = cm["u"]; x = cm.get("chain_notional_today", 0.0) or 0.0
-        prev = (prev_ema.get(sym) or {}).get("ema30") if isinstance(prev_ema.get(sym), dict) else None
-        ema_out[sym] = {"ema30": ema_update(prev, x, alpha=0.15), "last_date": now.date().isoformat()}
+        prev_val = (prev_ema_map.get(sym) or {}).get("ema30") if isinstance(prev_ema_map.get(sym), dict) else None
+        ema_out[sym] = {"ema30": ema_update(prev_val, x, alpha=0.15), "last_date": now.date().isoformat()}
 
-    # Tape state
+    # Tape-lite with per-day cache
+    prev_tape = prev_tape if isinstance(prev_tape, dict) else {}
     tape_state = {}
+    today_iso = now.date().isoformat()
+
+    def build_tape_for(u):
+        cached = prev_tape.get(u)
+        if isinstance(cached, dict) and cached.get("asof") == today_iso:
+            return cached
+
+        tape = {"asof": today_iso}
+        try:
+            # previous day hi/lo
+            prev_days = daily_history(u, (now - timedelta(days=10)).date().isoformat())
+            if prev_days and len(prev_days) >= 2:
+                pd = prev_days[-2]
+                tape["prev_high"] = float(pd["high"])
+                tape["prev_low"]  = float(pd["low"])
+        except Exception:
+            pass
+
+        allow_tierb = (not TAPE_TIERA_ONLY) and ( (u in tierb_tape_whitelist) or (u in TIER_A) )
+        if (u in TIER_A) or allow_tierb:
+            try:
+                bars = timesales(u, interval=TAPE_INTERVAL)
+                if bars:
+                    closes = [float(r["close"]) for r in bars if r.get("close") is not None]
+                    tape["open"] = float(bars[0]["open"]) if bars[0].get("open") is not None else tape.get("open")
+                    tape["vwap"] = compute_vwap(bars)
+                    tape["rsi5"] = rsi(closes, 5)
+                    vols = [int(r.get("volume") or 0) for r in bars]
+                    if vols:
+                        tape["vol5m_now"]    = vols[-1]
+                        tape["vol5m_median"] = sorted(vols)[len(vols)//2]
+            except Exception:
+                pass
+        return tape
+
     for urow in underliers:
         u = urow["u"]
-        t = urow.get("tape")
-        if t: tape_state[u] = t
+        tape_state[u] = build_tape_for(u)
 
     # Coverage stats
     with_delta = sum(1 for q in quotes if q.get("delta") is not None)
@@ -600,6 +643,7 @@ def main():
     total_q    = len(quotes)
     print(f"[relay] quotes_out={total_q} greeks_with_delta={with_delta} core={with_core}")
 
+    # Publish market.json
     market_payload = {
         "meta": {
             "source": "tradier",
