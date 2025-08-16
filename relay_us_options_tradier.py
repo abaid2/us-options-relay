@@ -13,7 +13,7 @@
 #   • Concurrency (RELAY_WORKERS).
 #   • Chain prefilter (OI+spread) before quotes.
 #   • ±5 strike wings + delta/IV persisted.
-#   • Tape-lite: one timesales call/symbol (5min default) with per-day cache and last-trading-day fallback.
+#   • Tape-lite: one timesales call/symbol (5min default) with per-day cache and last-trading-day fallback (+ proxy for SPX/XSP).
 #   • Typical run < 3 minutes with defaults; 12-minute timeout headroom.
 
 import os, json, re, urllib.parse
@@ -40,11 +40,15 @@ TIERB_LIMIT      = int(os.environ.get("TIERB_LIMIT",    "40"))    # 0 = no cap
 TAPE_TIERA_ONLY  = os.environ.get("TAPE_TIERA_ONLY","1").lower() in ("1","true","yes")  # 1 = tape only Tier-A
 TAPE_B_TOPN      = int(os.environ.get("TAPE_B_TOPN","12"))  # tape for top-N Tier-B by chain OI; 0 = all Tier-B
 TAPE_INTERVAL    = os.environ.get("TAPE_INTERVAL","5min")   # "5min" (recommended) or "1min"
+FALLBACK_INTERVAL= os.environ.get("FALLBACK_INTERVAL","1min")
 
 # History knobs
 MAX_EARNINGS_QTRS      = int(os.environ.get("MAX_EARNINGS_QTRS", "28"))   # ~7 years
 DAILY_LOOKBACK_YEARS   = int(os.environ.get("DAILY_LOOKBACK_YEARS", "8"))
 FORCE_HISTORY_REFRESH  = os.environ.get("FORCE_HISTORY_REFRESH", "").lower() in ("1","true","yes")
+
+# Tape proxy for index-like tickers
+TAPE_PROXY = {"SPX": "SPY", "XSP": "SPY"}
 
 # Required envs
 assert TRADIER_TOKEN and TRADIER_BASE and GIST_TOKEN and GIST_ID_MARKET and GIST_ID_HISTORY, "Missing env vars."
@@ -66,7 +70,7 @@ TIER_A_EQUITIES = ["TSLA","NVDA","AAPL","MSFT","META","AMD","GOOGL","NFLX","AVGO
 def now_utc_iso() -> str:
     return dt.datetime.now(UTC).replace(microsecond=0).isoformat()
 
-def http_get_json(url, headers=None, params=None, timeout=25):
+def http_get_json(url, headers=None, params=None, timeout=30):
     r = requests.get(url, headers=headers, params=params, timeout=timeout)
     r.raise_for_status()
     return r.json()
@@ -74,7 +78,7 @@ def http_get_json(url, headers=None, params=None, timeout=25):
 def gh_put(gist_id: str, filename: str, obj):
     url = f"https://api.github.com/gists/{gist_id}"
     payload = {"files": {filename: {"content": json.dumps(obj, indent=2)}}}
-    r = requests.patch(url, headers=HDR_GH, json=payload, timeout=25)
+    r = requests.patch(url, headers=HDR_GH, json=payload, timeout=30)
     r.raise_for_status()
 
 def gh_get(gist_id: str, filename: str):
@@ -137,10 +141,6 @@ def _is_valid_occ(sym: str) -> bool:
     return bool(sym) and bool(_OCC_RE.match(sym))
 
 def _occ_type(sym: str):
-    m = _ACC if False else _OCC_TYPE_RE.search(sym or "")  # keep static analyzers happy
-    return ("call" if m and m.group(1) == "C" else "put") if m else None
-
-def _occ_type(sym: str):
     m = _OCC_TYPE_RE.search(sym or "")
     return ("call" if m and m.group(1) == "C" else "put") if m else None
 
@@ -193,13 +193,22 @@ def quotes_options(symbols):
             raise
     return out
 
-# Timesales (tape-lite)
+# Timesales (tape-lite) — explicit intraday window + fallback interval
 def timesales(sym, interval="5min", day=None):
+    """
+    Fetch intraday bars for a full session window.
+    Tradier expects 'start' and 'end' with HH:MM; otherwise it can return zero rows.
+    """
     if day is None:
         day = dt.datetime.now(UTC).date().isoformat()
-    j = http_get_json(f"{TRADIER_BASE}/markets/timesales", headers=HDR_TR,
-                      params={"symbol": sym, "interval": interval, "start": day, "end": day, "session_filter":"all"})
-    rows = (j.get("series",{}) or {}).get("data") or []
+    start = f"{day} 00:00"
+    end   = f"{day} 23:59"
+    j = http_get_json(
+        f"{TRADIER_BASE}/markets/timesales",
+        headers=HDR_TR,
+        params={"symbol": sym, "interval": interval, "start": start, "end": end, "session_filter": "all"}
+    )
+    rows = (j.get("series", {}) or {}).get("data") or []
     return [rows] if isinstance(rows, dict) else rows
 
 def compute_vwap(bars):
@@ -346,8 +355,8 @@ def compute_comps(symbol, earn_dates):
     out = []
     for d in earn_dates:
         d0 = dt.date.fromisoformat(d)
-        d_1 = next(( (d0 - timedelta(days=k)).isoformat() for k in range(1,4) if (d0 - timedelta(days=k)).isoformat() in idx ), None)
-        d1  = next(( (d0 + timedelta(days=k)).isoformat() for k in range(1,4) if (d0 + timedelta(days=k)).isoformat() in idx ), None)
+        d_1 = next(((d0 - timedelta(days=k)).isoformat() for k in range(1,4) if (d0 - timedelta(days=k)).isoformat() in idx), None)
+        d1  = next(((d0 + timedelta(days=k)).isoformat() for k in range(1,4) if (d0 + timedelta(days=k)).isoformat() in idx), None)
         bar_d0 = idx.get(d)
         if not bar_d0: continue
         if d_1:
@@ -599,7 +608,7 @@ def main():
         prev_val = (prev_ema_map.get(sym) or {}).get("ema30") if isinstance(prev_ema_map.get(sym), dict) else None
         ema_out[sym] = {"ema30": ema_update(prev_val, x, alpha=0.15), "last_date": now.date().isoformat()}
 
-    # === Tape-lite with per-day cache + last-trading-day fallback ===
+    # === Tape-lite with per-day cache + last-trading-day + proxy fallback ===
     prev_tape = prev_tape if isinstance(prev_tape, dict) else {}
     tape_state = {}
     today_iso = now.date().isoformat()
@@ -612,13 +621,19 @@ def main():
         dlast = str(days[-1]["date"])
         return dlast if dlast != today_iso else str(days[-2]["date"])
 
+    def _load_bars(sym, session_day):
+        bars = timesales(sym, interval=TAPE_INTERVAL, day=session_day)
+        if not bars and TAPE_INTERVAL != FALLBACK_INTERVAL:
+            bars = timesales(sym, interval=FALLBACK_INTERVAL, day=session_day)
+        return bars
+
     def build_tape_for(u):
         cached = prev_tape.get(u)
         if isinstance(cached, dict) and cached.get("asof") == today_iso:
             return cached
 
         tape = {"asof": today_iso}
-        # previous day hi/lo
+        # previous day hi/lo (always)
         try:
             prev_days = daily_history(u, (now - timedelta(days=10)).date().isoformat())
             if prev_days and len(prev_days) >= 2:
@@ -632,16 +647,18 @@ def main():
         allow_tierb = (not TAPE_TIERA_ONLY) and ( (u in tierb_tape_whitelist) or (u in TIER_A) )
         if (u in TIER_A) or allow_tierb:
             session = today_iso
-            bars = []
-            try:
-                # try today's bars first
-                bars = timesales(u, interval=TAPE_INTERVAL, day=session)
+            bars = _load_bars(u, session)
+
+            if not bars:
+                session = last_trading_day(u)
+                bars = _load_bars(u, session)
+
+            if not bars and u in TAPE_PROXY:
+                proxy = TAPE_PROXY[u]
+                bars = _load_bars(proxy, today_iso)
                 if not bars:
-                    # fallback: last trading day (e.g., Friday if weekend)
-                    session = last_trading_day(u)
-                    bars = timesales(u, interval=TAPE_INTERVAL, day=session)
-            except Exception:
-                bars = []
+                    bars = _load_bars(proxy, last_trading_day(proxy))
+                tape["proxy"] = proxy
 
             if bars:
                 closes = [float(r["close"]) for r in bars if r.get("close") is not None]
@@ -666,8 +683,8 @@ def main():
         urow["tape"] = t
 
     print(f"[relay] tape symbols={len(tape_state)} "
-          f"with_vwap={sum(1 for t in tape_state.values() if t.get('vwap') is not None)} "
-          f"with_rsi={sum(1 for t in tape_state.values() if t.get('rsi5') is not None)}")
+          f"with_vwap={sum(1 for t in tape_state.values() if t.get('vwap'))} "
+          f"with_rsi={sum(1 for t in tape_state.values() if t.get('rsi5'))}")
 
     # Coverage stats
     with_delta = sum(1 for q in quotes if q.get("delta") is not None)
