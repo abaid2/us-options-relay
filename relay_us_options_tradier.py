@@ -13,7 +13,7 @@
 #   • Concurrency (RELAY_WORKERS).
 #   • Chain prefilter (OI+spread) before quotes.
 #   • ±5 strike wings + delta/IV persisted.
-#   • Tape-lite: one timesales call/symbol (5min default) with per-day cache.
+#   • Tape-lite: one timesales call/symbol (5min default) with per-day cache and last-trading-day fallback.
 #   • Typical run < 3 minutes with defaults; 12-minute timeout headroom.
 
 import os, json, re, urllib.parse
@@ -135,6 +135,10 @@ _MAX_URL        = 1500
 
 def _is_valid_occ(sym: str) -> bool:
     return bool(sym) and bool(_OCC_RE.match(sym))
+
+def _occ_type(sym: str):
+    m = _ACC if False else _OCC_TYPE_RE.search(sym or "")  # keep static analyzers happy
+    return ("call" if m and m.group(1) == "C" else "put") if m else None
 
 def _occ_type(sym: str):
     m = _OCC_TYPE_RE.search(sym or "")
@@ -595,10 +599,18 @@ def main():
         prev_val = (prev_ema_map.get(sym) or {}).get("ema30") if isinstance(prev_ema_map.get(sym), dict) else None
         ema_out[sym] = {"ema30": ema_update(prev_val, x, alpha=0.15), "last_date": now.date().isoformat()}
 
-    # Tape-lite with per-day cache
+    # === Tape-lite with per-day cache + last-trading-day fallback ===
     prev_tape = prev_tape if isinstance(prev_tape, dict) else {}
     tape_state = {}
     today_iso = now.date().isoformat()
+
+    def last_trading_day(sym):
+        # Use the last completed daily bar as the 'session' date
+        days = daily_history(sym, (now - timedelta(days=10)).date().isoformat())
+        if not days or len(days) < 2:
+            return today_iso
+        dlast = str(days[-1]["date"])
+        return dlast if dlast != today_iso else str(days[-2]["date"])
 
     def build_tape_for(u):
         cached = prev_tape.get(u)
@@ -606,8 +618,8 @@ def main():
             return cached
 
         tape = {"asof": today_iso}
+        # previous day hi/lo
         try:
-            # previous day hi/lo
             prev_days = daily_history(u, (now - timedelta(days=10)).date().isoformat())
             if prev_days and len(prev_days) >= 2:
                 pd = prev_days[-2]
@@ -616,26 +628,46 @@ def main():
         except Exception:
             pass
 
+        # decide if we compute intraday tape for this symbol
         allow_tierb = (not TAPE_TIERA_ONLY) and ( (u in tierb_tape_whitelist) or (u in TIER_A) )
         if (u in TIER_A) or allow_tierb:
+            session = today_iso
+            bars = []
             try:
-                bars = timesales(u, interval=TAPE_INTERVAL)
-                if bars:
-                    closes = [float(r["close"]) for r in bars if r.get("close") is not None]
-                    tape["open"] = float(bars[0]["open"]) if bars[0].get("open") is not None else tape.get("open")
-                    tape["vwap"] = compute_vwap(bars)
-                    tape["rsi5"] = rsi(closes, 5)
-                    vols = [int(r.get("volume") or 0) for r in bars]
-                    if vols:
-                        tape["vol5m_now"]    = vols[-1]
-                        tape["vol5m_median"] = sorted(vols)[len(vols)//2]
+                # try today's bars first
+                bars = timesales(u, interval=TAPE_INTERVAL, day=session)
+                if not bars:
+                    # fallback: last trading day (e.g., Friday if weekend)
+                    session = last_trading_day(u)
+                    bars = timesales(u, interval=TAPE_INTERVAL, day=session)
             except Exception:
-                pass
+                bars = []
+
+            if bars:
+                closes = [float(r["close"]) for r in bars if r.get("close") is not None]
+                tape["session_date"] = session
+                tape["open"] = float(bars[0]["open"]) if bars[0].get("open") is not None else tape.get("open")
+                tape["vwap"] = compute_vwap(bars)
+                tape["rsi5"] = rsi(closes, 5)
+                vols = [int(r.get("volume") or 0) for r in bars]
+                if vols:
+                    tape["vol5m_now"]    = vols[-1]
+                    tape["vol5m_median"] = sorted(vols)[len(vols)//2]
+            else:
+                tape["session_date"] = session
+
         return tape
 
+    # assemble state.tape and also copy into each underlier for convenience
     for urow in underliers:
         u = urow["u"]
-        tape_state[u] = build_tape_for(u)
+        t = build_tape_for(u)
+        tape_state[u] = t
+        urow["tape"] = t
+
+    print(f"[relay] tape symbols={len(tape_state)} "
+          f"with_vwap={sum(1 for t in tape_state.values() if t.get('vwap') is not None)} "
+          f"with_rsi={sum(1 for t in tape_state.values() if t.get('rsi5') is not None)}")
 
     # Coverage stats
     with_delta = sum(1 for q in quotes if q.get("delta") is not None)
