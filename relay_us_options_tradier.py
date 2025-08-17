@@ -629,9 +629,15 @@ def main():
         if r.get("fallback"):  chain_fallback_all.update(r["fallback"])
 
     # Determine Tier-B tape whitelist (top-N by chain OI after prefilter)
-    tierb_chain = [cm for cm in chain_metrics if cm["u"] in tierB_syms]
-    tierb_chain.sort(key=lambda x: x.get("chain_oi_total",0), reverse=True)
-    tierb_tape_whitelist = set(cm["u"] for cm in tierb_chain[:max(0, TIERB_B_TOPN if (TAPE_B_TOPN:=TAPE_B_TOPN) else 0)]) if TAPE_B_TOPN else set(tierB_syms)
+    if TAPE_B_TOPN:
+        tierb_chain_sorted = sorted(
+            (cm for cm in chain_metrics if cm["u"] in tierB_syms),
+            key=lambda x: x.get("chain_oi_total", 0),
+            reverse=True,
+        )
+        tierb_tape_whitelist = set(cm["u"] for cm in tierb_chain_sorted[:TAPE_B_TOPN])
+    else:
+        tierb_tape_whitelist = set(tierB_syms)
 
     # Quotes for selected legs
     qts   = quotes_options(opt_symbols)
