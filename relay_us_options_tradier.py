@@ -9,8 +9,7 @@
 #   • Requests use a session with retries/backoff; per-call connect/read timeouts.
 #   • Any per-symbol failure is handled gracefully (symbol skipped; job continues).
 #   • Tape-lite uses explicit time window, last-trading-day & 1min fallback, SPX/XSP→SPY proxy.
-#   • Tier-B "minimal quotes" collection for earnings singles (ATM + Δ bands) to unlock Stage-1/2.
-#   • Earnings comps default to Tier-A equities only; Tier-B comps behind a knob.
+#   • Tier-B "minimal quotes" enrichment for earnings singles (ATM + Δ bands) to unlock Stage-1/2.
 
 import os, json, re, urllib.parse
 import datetime as dt
@@ -35,20 +34,19 @@ RELAY_WORKERS    = int(os.environ.get("RELAY_WORKERS",  "8"))
 TIERB_LIMIT      = int(os.environ.get("TIERB_LIMIT",    "40"))    # 0 = no cap (calendar list only)
 
 # Tape knobs
-TAPE_TIERA_ONLY   = os.environ.get("TAPE_TIERA_ONLY","1").lower() in ("1","true","yes")
-TAPE_B_TOPN       = int(os.environ.get("TAPE_B_TOPN","12"))       # tape for top-N Tier-B by chain OI; 0 = all Tier-B
-TAPE_INTERVAL     = os.environ.get("TAPE_INTERVAL","5min")        # "5min" (recommended) or "1min"
+TAPE_TIERA_ONLY   = os.environ.get("TAPE_TIERA_ONLY","1").lower() in ("1","true","yes")  # 1 = tape only Tier-A
+TAPE_B_TOPN       = int(os.environ.get("TAPE_B_TOPN","12"))  # tape for top-N Tier-B by chain OI; 0 = all Tier-B
+TAPE_INTERVAL     = os.environ.get("TAPE_INTERVAL","5min")   # "5min" (recommended) or "1min"
 FALLBACK_INTERVAL = os.environ.get("FALLBACK_INTERVAL","1min")
 TAPE_FORCE_REFRESH= os.environ.get("TAPE_FORCE_REFRESH","").lower() in ("1","true","yes")
 TAPE_PROXY        = {"SPX": "SPY", "XSP": "SPY"}  # index proxies
 
-# Tier-B minimal quotes knobs
-TIERB_MINI_TOPN           = int(os.environ.get("TIERB_MINI_TOPN","15")) # top-N Tier-B by chain OI to enrich (0 = all)
-TIERB_EVENT_WINDOW_DAYS   = int(os.environ.get("TIERB_EVENT_WINDOW_DAYS","10"))
-TIERB_PRIMARY_DELTA_MID   = float(os.environ.get("TIERB_PRIMARY_DELTA_MID","0.35")) # target 0.25–0.45; mid=0.35
-TIERB_LOTTO_DELTA_MID     = float(os.environ.get("TIERB_LOTTO_DELTA_MID","0.18"))   # target 0.10–0.25; mid=0.18
-TIERB_DELTA_WIGGLE        = float(os.environ.get("TIERB_DELTA_WIGGLE","0.08"))      # ± around mid
-TIERB_MINI_ALWAYS         = os.environ.get("TIERB_MINI_ALWAYS","1").lower() in ("1","true","yes")  # gather even if chain gates fail
+# Tier-B minimal quotes (earnings singles) — enable/limit
+TIERB_MINI_ENABLE        = os.environ.get("TIERB_MINI_ENABLE","1").lower() in ("1","true","yes")
+TIERB_MINI_TOPN          = int(os.environ.get("TIERB_MINI_TOPN","15"))  # 0 = all Tier-B in window
+TIERB_EVENT_WINDOW_DAYS  = int(os.environ.get("TIERB_EVENT_WINDOW_DAYS","10"))
+TIERB_PRIMARY_DELTA_MID  = float(os.environ.get("TIERB_PRIMARY_DELTA_MID","0.35"))  # ~0.25–0.45 band
+TIERB_LOTTO_DELTA_MID    = float(os.environ.get("TIERB_LOTTO_DELTA_MID","0.18"))    # ~0.10–0.25 band
 
 # History knobs
 MAX_EARNINGS_QTRS      = int(os.environ.get("MAX_EARNINGS_QTRS", "28"))   # ~7 years
@@ -278,12 +276,11 @@ def nearest_weekly_for_event(sym, earnings_date, window_days=7):
     exps = expirations(sym)
     if not exps: return None
     e = dt.date.fromisoformat(earnings_date)
-    # prefer Friday on/after earnings date
     target = nearest_friday_on_or_after(e.isoformat())
-    # exact match or next
     for d in exps:
-        if d >= target: return d
-    # else nearest in ±window
+        if d >= target:
+            return d
+    # nearest within ±window
     best = None; bd = 999
     for d in exps:
         dd = abs((dt.date.fromisoformat(d) - e).days)
@@ -430,6 +427,17 @@ def main():
     symbols    = sorted(set(TIER_A + tierB_syms))
     print(f"[relay] symbols={len(symbols)} tierB={len(tierB_syms)}")
 
+    # Tier-B events within window for enrichment
+    e_by_sym = {}
+    if TIERB_MINI_ENABLE:
+        for x in earn:
+            try:
+                d = dt.date.fromisoformat(x["date"])
+                if 0 <= (d - now.date()).days <= TIERB_EVENT_WINDOW_DAYS:
+                    e_by_sym.setdefault(x["symbol"], []).append(x["date"])
+            except Exception:
+                continue
+
     # Optional history.json (Tier-A equities + Tier-B on demand)
     if FINNHUB_TOKEN:
         candidates = sorted(set(TIER_A_EQUITIES + (list(tierB_syms) if HISTORY_TIERB else [])))
@@ -485,16 +493,6 @@ def main():
     opt_symbols  = []
     chain_fallback_all = {}
 
-    # Helper: Tier-B event window map
-    e_by_sym = {}
-    for x in earn:
-        try:
-            d = dt.date.fromisoformat(x["date"])
-            if (d - now.date()).days <= TIERB_EVENT_WINDOW_DAYS:
-                e_by_sym.setdefault(x["symbol"], []).append(x["date"])
-        except Exception:
-            continue
-
     # Per-symbol worker
     def process_symbol(u):
         try:
@@ -511,16 +509,13 @@ def main():
                 atr14 = atr_from_history(days[-80:],14) if days else None
                 atr_updates[u] = {"asof": now.date().isoformat(), "atr5": atr5, "atr14": atr14}
 
-            # Pick expiry
-            e_dates = e_by_sym.get(u, [])
-            under = {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()}
-
-            # Prefer event-week expiry for Tier-B; else nearest Friday ~+7d
-            if e_dates:
-                expiry = nearest_weekly_for_event(u, e_dates[0], window_days=7)
+            # Preferred expiry (Tier-B -> event-week; else nearest Friday ~+7d)
+            if u in e_by_sym:
+                expiry = nearest_weekly_for_event(u, e_by_sym[u][0], window_days=7)
             else:
                 desired = nearest_friday_on_or_after((now + timedelta(days=7)).date().isoformat())
                 expiry  = pick_expiration(u, desired)
+            under = {"u": u, "spot": spot, "atr5": atr5, "atr14": atr14, "updated_utc": now_utc_iso()}
             if not expiry:
                 return {"underlier": under}
 
@@ -528,61 +523,23 @@ def main():
             if not chain_rows:
                 return {"underlier": under}
 
-            # Chain metrics (for ranking / gates / Tier-B topN)
+            # Chain metrics (for gates/ranking)
             cm = chain_metrics_from_chain(chain_rows)
 
-            # Chain prefilter (hard gates) for Tier-A only; Tier-B minimal quotes may still proceed
-            is_tiera = u in TIER_A
+            # Chain prefilter for Tier-A; Tier-B enrichment can still happen later
             pass_chain = True
-            if is_tiera:
+            if u in TIER_A:
                 if cm.get("chain_oi_total", 0) < 15000: pass_chain = False
                 ms = cm.get("chain_median_spread_pct")
                 if ms is not None and ms > 0.10: pass_chain = False
 
-            # Standard legs (Tier-A; Tier-B if gates passed)
             legs = []
             if pass_chain:
                 picks = pick_targets(chain_rows, spot, how_many=5)
                 if picks["atm"]: legs += list(picks["atm"])
                 for c_leg, p_leg in picks["wings"]: legs += [c_leg, p_leg]
 
-            # Tier-B minimal quotes (even if chain gates fail)
-            if (u in tierB_syms) and (u in e_by_sym) and (TIERB_MINI_ALWAYS or pass_chain):
-                # ATM pair (ensure present)
-                if not legs:
-                    calls = sorted([c for c in chain_rows if (c.get("option_type") or "").lower()=="call"], key=lambda x: abs(float(x.get("strike",0))-spot))
-                    puts  = sorted([p for p in chain_rows if (p.get("option_type") or "").lower()=="put"],  key=lambda x: abs(float(x.get("strike",0))-spot))
-                    if calls and puts:
-                        legs += [calls[0], puts[0]]
-                # delta-band singles
-                def best_delta(side, target):
-                    best=None; bd=1e9
-                    for o in chain_rows:
-                        if (o.get("option_type") or "").lower() != side: continue
-                        d = ((o.get("greeks") or {}).get("delta"))
-                        try: d = abs(float(d)) if d is not None else None
-                        except: d=None
-                        if d is None: continue
-                        dd = abs(d - target)
-                        if dd < bd: bd, best = dd, o
-                    return best
-                # If greeks are missing, approximate from rank (moneyness)
-                def approx_by_rank(side, idx):
-                    rows = sorted([o for o in chain_rows if (o.get("option_type") or "").lower()==side],
-                                  key=lambda x: abs(float(x.get("strike",0))-spot))
-                    return rows[min(idx, len(rows)-1)] if rows else None
-
-                # Primary ~0.35Δ
-                c_primary = best_delta("call", TIERB_PRIMARY_DELTA_MID) or approx_by_rank("call", 2)
-                p_primary = best_delta("put",  TIERB_PRIMARY_DELTA_MID) or approx_by_rank("put",  2)
-                # Lotto   ~0.18Δ
-                c_lotto  = best_delta("call", TIERB_LOTTO_DELTA_MID)   or approx_by_rank("call", 4)
-                p_lotto  = best_delta("put",  TIERB_LOTTO_DELTA_MID)   or approx_by_rank("put",  4)
-
-                for o in (c_primary, p_primary, c_lotto, p_lotto):
-                    if o and o not in legs: legs.append(o)
-
-            # Chain fallback (bid/ask/oi/volume + greeks) for selected legs
+            # Chain fallback for any selected legs
             def fnum(x):
                 try: return float(x)
                 except: return None
@@ -604,6 +561,7 @@ def main():
                     "type": ("C" if (l.get("option_type") or _occ_type(l.get("symbol")))=="call" else "P"),
                     "strike": float(l.get("strike") or _occ_strike(l.get("symbol"))),
                     "contract": l.get("symbol")} for l in legs if l.get("symbol")]
+
             return {"underlier": under, "cm": {"u": u, "expiry": expiry, **cm},
                     "sel": sel, "fallback": fallback}
         except Exception:
@@ -617,9 +575,7 @@ def main():
             r = fut.result()
             if r: results.append(r)
 
-    # Aggregate
-    underliers, chain_metrics, sel_meta, opt_symbols = [], [], [], []
-    chain_fallback_all = {}
+    # Aggregate first pass
     for r in results:
         if r.get("underlier"): underliers.append(r["underlier"])
         if r.get("cm"):        chain_metrics.append(r["cm"])
@@ -628,29 +584,126 @@ def main():
             opt_symbols.extend([s["contract"] for s in r["sel"]])
         if r.get("fallback"):  chain_fallback_all.update(r["fallback"])
 
-    # Determine Tier-B tape whitelist (top-N by chain OI after prefilter)
+    # ===== Tier-B minimal quotes enrichment (second pass; after metrics) =====
+    if TIERB_MINI_ENABLE and e_by_sym:
+        # Top-N Tier-B by chain OI (within window)
+        tierb_chain_sorted = sorted(
+            (cm for cm in chain_metrics if cm["u"] in e_by_sym),
+            key=lambda x: x.get("chain_oi_total", 0),
+            reverse=True
+        )
+        if TIERB_MINI_TOPN > 0:
+            tierb_enrich_whitelist = set(cm["u"] for cm in tierb_chain_sorted[:TIERB_MINI_TOPN])
+        else:
+            tierb_enrich_whitelist = set(e_by_sym.keys())
+
+        # Build a set of symbols already with quotes (to avoid duplication)
+        already_quoted = set(u for u in [m["u"] for m in sel_meta])
+
+        for u in sorted(tierb_enrich_whitelist):
+            try:
+                if u in already_quoted:
+                    continue  # we already have legs for this Tier-B symbol
+                spot = quote_underlier(u)
+                if not spot:
+                    continue
+                # choose event-week expiry
+                expiry = nearest_weekly_for_event(u, e_by_sym[u][0], window_days=7)
+                if not expiry:
+                    continue
+                # pull chain for that expiry
+                chain_rows = chains(u, expiry)
+                if not chain_rows:
+                    continue
+                # ATM pair
+                calls = sorted([c for c in chain_rows if (c.get("option_type") or "").lower()=="call"],
+                               key=lambda x: abs(float(x.get("strike",0))-spot))
+                puts  = sorted([p for p in chain_rows if (p.get("option_type") or "").lower()=="put"],
+                               key=lambda x: abs(float(x.get("strike",0))-spot))
+                legs = []
+                if calls and puts:
+                    legs += [calls[0], puts[0]]
+
+                # delta-band singles
+                def best_delta(side, target):
+                    best=None; bd=1e9
+                    for o in chain_rows:
+                        if (o.get("option_type") or "").lower()!=side: continue
+                        d = ((o.get("greeks") or {}).get("delta"))
+                        try: d = abs(float(d)) if d is not None else None
+                        except: d=None
+                        if d is None: continue
+                        dd = abs(d - target)
+                        if dd < bd: bd, best = dd, o
+                    return best
+
+                def approx_by_rank(side, rank_index):
+                    rows = sorted([o for o in chain_rows if (o.get("option_type") or "").lower()==side],
+                                  key=lambda x: abs(float(x.get("strike",0)) - spot))
+                    return rows[min(rank_index, len(rows)-1)] if rows else None
+
+                c35 = best_delta("call", TIERB_PRIMARY_DELTA_MID) or approx_by_rank("call", 2)
+                p35 = best_delta("put",  TIERB_PRIMARY_DELTA_MID) or approx_by_rank("put",  2)
+                c18 = best_delta("call", TIERB_LOTTO_DELTA_MID)   or approx_by_rank("call", 4)
+                p18 = best_delta("put",  TIERB_LOTTO_DELTA_MID)   or approx_by_rank("put",  4)
+
+                for o in (c35, p35, c18, p18):
+                    if o and o not in legs:
+                        legs.append(o)
+
+                # fallback map for these legs
+                def fnum(x):
+                    try: return float(x)
+                    except: return None
+                for o in chain_rows:
+                    if o.get("symbol") in {l.get("symbol") for l in legs if l.get("symbol")}:
+                        g = o.get("greeks") or {}
+                        chain_fallback_all[o["symbol"]] = {
+                            "bid": fnum(o.get("bid")), "ask": fnum(o.get("ask")),
+                            "volume": int(o.get("volume") or 0),
+                            "oi": int(o.get("open_interest") or 0),
+                            "iv": fnum(g.get("mid_iv")) or fnum(g.get("smv_vol")),
+                            "delta": fnum(g.get("delta")), "gamma": fnum(g.get("gamma")),
+                            "theta": fnum(g.get("theta")), "vega": fnum(g.get("vega")),
+                        }
+
+                # register legs for quotes batch
+                for l in legs:
+                    sym = l.get("symbol")
+                    if not sym: continue
+                    sel_meta.append({
+                        "u": u, "expiry": expiry,
+                        "type": ("C" if (l.get("option_type") or _occ_type(sym))=="call" else "P"),
+                        "strike": float(l.get("strike") or _occ_strike(sym)),
+                        "contract": sym
+                    })
+                    opt_symbols.append(sym)
+            except Exception:
+                continue
+
+    # ===== Tape whitelist for Tier-B =====
     if TAPE_B_TOPN:
         tierb_chain_sorted = sorted(
             (cm for cm in chain_metrics if cm["u"] in tierB_syms),
-            key=lambda x: x.get("chain_oi_total", 0),
-            reverse=True,
+            key=lambda x: x.get("chain_oi_total",0),
+            reverse=True
         )
         tierb_tape_whitelist = set(cm["u"] for cm in tierb_chain_sorted[:TAPE_B_TOPN])
     else:
         tierb_tape_whitelist = set(tierB_syms)
 
-    # Quotes for selected legs
+    # ===== Quotes for all selected legs =====
     qts   = quotes_options(opt_symbols)
     bysym = {q.get("symbol"): q for q in qts} if qts else {}
 
     # Build quotes with fallbacks; persist greeks
-    prev_last_good = prev_last_good if isinstance(prev_last_good, dict) else {}
-    last_good = dict(prev_last_good)
+    last_good = dict(prev_last_good if isinstance(prev_last_good, dict) else {})
     quotes    = []
     for m in sel_meta:
         q   = bysym.get(m["contract"], {})
         bid = q.get("bid"); ask = q.get("ask"); last = q.get("last")
         oi  = q.get("open_interest"); vol = q.get("volume")
+
         def f(x):
             try: return float(x)
             except: return None
@@ -662,6 +715,7 @@ def main():
             delta = f(g.get("delta")); gamma = f(g.get("gamma"))
             theta = f(g.get("theta")); vega  = f(g.get("vega"))
         ts  = q.get("trade_date") or q.get("updated") or now_utc_iso()
+
         fb = chain_fallback_all.get(m["contract"])
         if (bid is None) or (ask is None) or (oi is None) or (vol is None):
             if fb:
@@ -683,9 +737,11 @@ def main():
                 oi  = lg.get("oi")  if oi  is None else oi
                 vol = lg.get("volume") if vol is None else vol
                 ts  = lg.get("quote_time_utc") or ts
+
         if (bid is not None) and (ask is not None) and (oi is not None) and (vol is not None):
             last_good[m["contract"]] = {"bid": float(bid), "ask": float(ask), "oi": int(oi), "volume": int(vol),
                                         "iv": float(iv) if iv is not None else None, "quote_time_utc": ts}
+
         quotes.append({
             "u": m["u"], "contract": m["contract"], "expiry": m["expiry"], "type": m["type"], "strike": m["strike"],
             "bid": float(bid) if bid is not None else None,
@@ -699,11 +755,8 @@ def main():
             "quote_time_utc": ts
         })
 
-    # ATR cache updates
-    if atr_updates:
-        prev_atr.update(atr_updates)
-
-    # EMA update
+    # ===== Chain metrics, EMA, Tape =====
+    # (chain_metrics already collected from first pass)
     prev_ema = prev_ema if isinstance(prev_ema, dict) else {}
     ema_out = {}
     for cm in chain_metrics:
@@ -711,7 +764,7 @@ def main():
         prev_val = (prev_ema.get(sym) or {}).get("ema30") if isinstance(prev_ema.get(sym), dict) else None
         ema_out[sym] = {"ema30": ema_update(prev_val, x, alpha=0.15), "last_date": now.date().isoformat()}
 
-    # Tape-lite (explicit window + last-trading-day + proxy; cache-aware)
+    # Tape-lite with caching + explicit window + last-trading-day + proxy fallback
     prev_tape = prev_tape if isinstance(prev_tape, dict) else {}
     tape_state = {}
     today_iso = now.date().isoformat()
@@ -728,6 +781,17 @@ def main():
             bars = timesales(sym, interval=FALLBACK_INTERVAL, day=session_day)
         return bars
 
+    # make Tier-B tape whitelist
+    if TAPE_B_TOPN:
+        tierb_chain_sorted = sorted(
+            (cm for cm in chain_metrics if cm["u"] in tierB_syms),
+            key=lambda x: x.get("chain_oi_total",0),
+            reverse=True
+        )
+        tierb_tape_whitelist = set(cm["u"] for cm in tierb_chain_sorted[:TAPE_B_TOPN])
+    else:
+        tierb_tape_whitelist = set(tierB_syms)
+
     def build_tape_for(u):
         cached = prev_tape.get(u)
         if not TAPE_FORCE_REFRESH and isinstance(cached, dict) and cached.get("asof") == today_iso \
@@ -738,8 +802,7 @@ def main():
             prev_days = daily_history(u, (now - timedelta(days=10)).date().isoformat())
             if prev_days and len(prev_days) >= 2:
                 pd = prev_days[-2]
-                tape["prev_high"] = float(pd["high"])
-                tape["prev_low"]  = float(pd["low"])
+                tape["prev_high"] = float(pd["high"]); tape["prev_low"] = float(pd["low"])
         except Exception:
             pass
         allow_tierb = (not TAPE_TIERA_ONLY) and ((u in tierb_tape_whitelist) or (u in TIER_A))
@@ -767,14 +830,6 @@ def main():
             else:
                 tape["session_date"] = session
         return tape
-
-    # figure Tier-B tape whitelist
-    if TAPE_B_TOPN:
-        tierb_chain_sorted = sorted([cm for cm in chain_metrics if cm["u"] in tierB_syms],
-                                    key=lambda x: x.get("chain_oi_total",0), reverse=True)
-        tierb_tape_whitelist = set(cm["u"] for cm in tierb_chain_sorted[:TAPE_B_TOPN])
-    else:
-        tierb_tape_whitelist = set(tierB_syms)
 
     for urow in underliers:
         u = urow["u"]
@@ -809,7 +864,7 @@ def main():
         "state": {
             "ema": ema_out,
             "last_good_quotes": last_good,
-            "atr_cache": (prev_atr or {}),
+            "atr_cache": (atr_updates and {**(prev_atr or {}), **atr_updates}) or (prev_atr or {}),
             "tape": tape_state
         }
     }
