@@ -10,8 +10,9 @@
 #   • Tape-lite with explicit time window, last-trading-day + 1min fallback, SPX/XSP→SPY proxy.
 #   • Tier-B “minimal quotes” enrichment (ATM + Δ≈0.35 & Δ≈0.18 singles) around the earnings week ± neighbor.
 #   • Chain prefilter for Tier-A; Tier-B enrichment bypasses gates to ensure singles exist.
+#   • NaN/Inf values are sanitized from JSON (written as null).
 
-import os, json, re, urllib.parse
+import os, json, re, urllib.parse, math
 import datetime as dt
 from datetime import timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -89,6 +90,16 @@ SESSION = _build_session()
 CONNECT_TIMEOUT = 6
 READ_TIMEOUT    = 30
 
+# ===== JSON SANITIZER =====
+def _clean_json(x):
+    if isinstance(x, dict):
+        return {k: _clean_json(v) for k, v in x.items()}
+    if isinstance(x, list):
+        return [_clean_json(v) for v in x]
+    if isinstance(x, float) and (math.isnan(x) or math.isinf(x)):
+        return None
+    return x
+
 # ===== HELPERS =====
 def now_utc_iso() -> str:
     return dt.datetime.now(UTC).replace(microsecond=0).isoformat()
@@ -99,10 +110,11 @@ def http_get_json(url, headers=None, params=None, timeout=READ_TIMEOUT):
     return r.json()
 
 def gh_put(gist_id: str, filename: str, obj):
+    payload = _clean_json(obj)
     r = SESSION.patch(
         f"https://api.github.com/gists/{gist_id}",
         headers=HDR_GH,
-        json={"files": {filename: {"content": json.dumps(obj, indent=2)}}},
+        json={"files": {filename: {"content": json.dumps(payload, indent=2)}}},
         timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)
     )
     r.raise_for_status()
@@ -524,6 +536,9 @@ def main():
                 days = daily_history(u, hist_start)
                 atr5  = atr_from_history(days[-40:], 5) if days else None
                 atr14 = atr_from_history(days[-80:],14) if days else None
+                # sanitize NaN/Inf
+                if isinstance(atr5, float) and (math.isnan(atr5) or math.isinf(atr5)): atr5 = None
+                if isinstance(atr14, float) and (math.isnan(atr14) or math.isinf(atr14)): atr14 = None
                 atr_updates[u] = {"asof": now.date().isoformat(), "atr5": atr5, "atr14": atr14}
 
             # Preferred expiry (Tier-B -> event-week; else nearest Friday ~+7d)
@@ -560,11 +575,12 @@ def main():
             def fnum(x):
                 try: return float(x)
                 except: return None
+            local_fallback = {}
             leg_syms = {l.get("symbol") for l in legs if l.get("symbol")}
             for o in chain_rows:
                 if o.get("symbol") in leg_syms:
                     g = o.get("greeks") or {}
-                    chain_fallback_all[o["symbol"]] = {
+                    local_fallback[o["symbol"]] = {
                         "bid": fnum(o.get("bid")), "ask": fnum(o.get("ask")),
                         "volume": int(o.get("volume") or 0),
                         "oi": int(o.get("open_interest") or 0),
@@ -579,7 +595,7 @@ def main():
                     "contract": l.get("symbol")} for l in legs if l.get("symbol")]
 
             return {"underlier": under, "cm": {"u": u, "expiry": expiry, **cm},
-                    "sel": sel, "fallback": chain_fallback_all}
+                    "sel": sel, "fallback": local_fallback}
         except Exception:
             return None
 
@@ -598,6 +614,8 @@ def main():
         if r.get("sel"):
             sel_meta.extend(r["sel"])
             opt_symbols.extend([s["contract"] for s in r["sel"]])
+        if r.get("fallback"):
+            chain_fallback_all.update(r["fallback"])
 
     # ===== Tier-B minimal quotes enrichment (after metrics) =====
     if TIERB_MINI_ENABLE and e_by_sym:
@@ -614,7 +632,6 @@ def main():
         )
         if TIERB_MINI_TOPN > 0:
             tierb_enrich_whitelist = [cm["u"] for cm in tierb_chain_sorted[:TIERB_MINI_TOPN]]
-            # If too few had metrics, add remaining in window until TOPN
             if len(tierb_enrich_whitelist) < TIERB_MINI_TOPN:
                 for s in e_by_sym.keys():
                     if s not in tierb_enrich_whitelist:
@@ -633,7 +650,7 @@ def main():
 
         for u in sorted(tierb_enrich_whitelist):
             try:
-                if u in already_u:  # already have legs for this symbol
+                if u in already_u:
                     continue
                 spot = quote_underlier(u)
                 if not spot:
@@ -641,7 +658,7 @@ def main():
                 evt_exp = nearest_weekly_for_event(u, e_by_sym[u][0], window_days=7)
                 exp_list = [evt_exp] if evt_exp else []
                 if TIERB_MULTI_WEEKLY and evt_exp:
-                    exp_list = neighbor_weeklies(u, evt_exp, window_days=7)[:2]  # cap to 2 expiries
+                    exp_list = neighbor_weeklies(u, evt_exp, window_days=7)[:2]  # cap 2 expiries
 
                 for expiry in exp_list:
                     chain_rows = chains(u, expiry) or []
@@ -792,7 +809,35 @@ def main():
         prev_val = (prev_ema.get(sym) or {}).get("ema30") if isinstance(prev_ema.get(sym), dict) else None
         ema_out[sym] = {"ema30": ema_update(prev_val, x, alpha=0.15), "last_date": now.date().isoformat()}
 
-    # Tape-lite (explicit window + last-trading-day + proxy; cache-aware)
+    # --- Tape helpers (prev H/L robust; timesales fallback) ---
+    def _prev_hilo_from_daily(sym):
+        days = daily_history(sym, (now - timedelta(days=14)).date().isoformat())
+        if days and len(days) >= 2:
+            pd = days[-2]
+            try:
+                return float(pd["high"]), float(pd["low"])
+            except Exception:
+                pass
+        return None, None
+
+    def _hilo_from_timesales(sym, session_day):
+        bars = timesales(sym, interval=TAPE_INTERVAL, day=session_day) or \
+               timesales(sym, interval=FALLBACK_INTERVAL, day=session_day)
+        if not bars:
+            return None, None
+        hi = None; lo = None
+        for r in bars:
+            h = r.get("high"); l = r.get("low")
+            if h is None: h = r.get("price") or r.get("close")
+            if l is None: l = r.get("price") or r.get("close")
+            try:
+                h = float(h); l = float(l)
+            except Exception:
+                continue
+            hi = h if hi is None or h > hi else hi
+            lo = l if lo is None or l < lo else lo
+        return hi, lo
+
     prev_tape = prev_tape if isinstance(prev_tape, dict) else {}
     tape_state = {}
     today_iso = now.date().isoformat()
@@ -826,13 +871,16 @@ def main():
            and (cached.get("vwap") is not None or cached.get("rsi5") is not None):
             return cached
         tape = {"asof": today_iso}
-        try:
-            prev_days = daily_history(u, (now - timedelta(days=10)).date().isoformat())
-            if prev_days and len(prev_days) >= 2:
-                pd = prev_days[-2]
-                tape["prev_high"] = float(pd["high"]); tape["prev_low"] = float(pd["low"])
-        except Exception:
-            pass
+        # prev high/low from daily; fallback to previous session timesales if daily missing
+        ph, pl = _prev_hilo_from_daily(u)
+        if ph is None or pl is None:
+            session_prev = last_trading_day(u)
+            ph2, pl2 = _hilo_from_timesales(u, session_prev)
+            if ph2 is not None: ph = ph2
+            if pl2 is not None: pl = pl2
+        if ph is not None: tape["prev_high"] = ph
+        if pl is not None: tape["prev_low"]  = pl
+
         allow_tierb = (not TAPE_TIERA_ONLY) and ((u in tierb_tape_whitelist) or (u in TIER_A))
         if (u in TIER_A) or allow_tierb:
             session = today_iso
@@ -848,7 +896,8 @@ def main():
                 closes = [float((r.get("close") if r.get("close") is not None else r.get("price") or 0))
                           for r in bars if (r.get("close") is not None or r.get("price") is not None)]
                 tape["session_date"] = session
-                tape["open"] = float(bars[0].get("open")) if bars[0].get("open") is not None else tape.get("open")
+                if bars and bars[0].get("open") is not None:
+                    tape["open"] = float(bars[0]["open"])
                 tape["vwap"] = compute_vwap(bars)
                 tape["rsi5"] = rsi(closes, 5)
                 vols = [int(r.get("volume") or 0) for r in bars]
