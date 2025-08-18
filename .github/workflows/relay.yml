@@ -173,7 +173,7 @@ jobs:
 
           # ==== Tape (keep cost reasonable; quotes are the priority) ====
           TAPE_TIERA_ONLY: "0"                 # include Tier-B tape
-          TAPE_B_TOPN: "16"                    # tape for top-16 Tier-B by chain OI
+          TAPE_B_TOPN: "0"                    # tape for top-16 Tier-B by chain OI
           TAPE_INTERVAL: "5min"
           FALLBACK_INTERVAL: "1min"
           TAPE_FORCE_REFRESH: "0"
