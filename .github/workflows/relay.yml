@@ -1,14 +1,14 @@
-name: Relay (Tradier to Gists - smart skip)
+name: Relay (Tradier to Gists — Tier-B Singles, 5-min)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # run every 5 minutes (UTC)
+    - cron: "*/5 * * * *"          # run every 5 minutes (UTC)
   workflow_dispatch:
     inputs:
       force_run:
         description: "Bypass smart skip and run the relay"
         required: false
-        default: "false"
+        default: "true"
 
 concurrency:
   group: relay-only
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 10              
 
     steps:
       - uses: actions/checkout@v4
@@ -64,8 +64,8 @@ jobs:
           HIST_MAX_AGE_H:      "168"   # 7 days
           GREEKS_COVERAGE_MIN: "0.60"  # >=60% of selected legs must have delta
           QUOTES_COVERAGE_MIN: "0.70"  # >=70% of quotes must have bid/ask/oi/volume
-          MIN_QUOTES:          "8"     # expect at least 8 legs written
-          MIN_CHAIN_SYMBOLS:   "6"     # expect metrics for >=6 symbols
+          MIN_QUOTES:          "40"    # expect >=40 legs written with enrichment
+          MIN_CHAIN_SYMBOLS:   "8"     # expect >=8 symbols with chain metrics
         shell: bash
         run: |
           set -e
@@ -100,7 +100,7 @@ jobs:
           mkt_age = now - to_epoch((mkt.get("meta") or {}).get("updated_utc",""))
           hist_age_h = (now - to_epoch((hist.get("meta") or {}).get("updated_utc",""))) / 3600.0
 
-          # Macro cache coverage
+          # Macro cache coverage (calendar.state.macro_cache is optional; if missing we won't skip)
           state = cal.get("state") or {}
           mc = state.get("macro_cache") or {}
           mc_events = mc.get("events") or []
@@ -132,7 +132,7 @@ jobs:
           mkt_fresh = mkt_age < int(os.environ["MKT_MAX_AGE_S"])
           hist_fresh= hist_age_h < float(os.environ["HIST_MAX_AGE_H"])
 
-          # Only skip if ALL are satisfied
+          # Only skip if ALL are satisfied (macro_ok may be False if you're not caching macro; that's fine)
           skip = cal_fresh and mkt_fresh and hist_fresh and macro_ok and greeks_cov_ok and quotes_cov_ok and chains_ok
 
           print(f"calendar age(s)={cal_age}  market age(s)={mkt_age}  history age(h)={hist_age_h:.1f}")
@@ -149,18 +149,39 @@ jobs:
       - name: Run relay
         if: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.force_run == 'true') || steps.freshness.outputs.skip != 'true' }}
         env:
+          # required
           TRADIER_TOKEN:    ${{ secrets.TRADIER_TOKEN }}
           FINNHUB_TOKEN:    ${{ secrets.FINNHUB_TOKEN }}
-          FMP_API_KEY:      ${{ secrets.FMP_API_KEY }}       # optional; used as macro fallback
           GIST_TOKEN:       ${{ secrets.GIST_TOKEN }}
           GIST_ID_CALENDAR: ${{ secrets.GIST_ID_CALENDAR }}
           GIST_ID_MARKET:   ${{ secrets.GIST_ID_MARKET }}
           GIST_ID_HISTORY:  ${{ secrets.GIST_ID_HISTORY }}
           TRADIER_BASE: https://api.tradier.com/v1
+
+          # runtime knobs
           INTERVAL_SEC: "300"
-          RELAY_WORKERS: "8"
-          TIERB_LIMIT: "40"
-          MACRO_TTL_HOURS: "12"
+          RELAY_WORKERS: "10"                  # a bit higher, still safe under 5 min
+          TIERB_LIMIT: "40"                    # calendar list cap
+
+          # ==== Tier-B singles enrichment (maximize info) ====
+          TIERB_MINI_ENABLE: "1"
+          TIERB_MINI_TOPN: "0"                 # 0 = enrich ALL Tier-B within the event window
+          TIERB_EVENT_WINDOW_DAYS: "10"
+          TIERB_PRIMARY_DELTA_MID: "0.35"
+          TIERB_LOTTO_DELTA_MID: "0.18"
+          TIERB_MULTI_WEEKLY: "1"              # include neighbor weekly (e.g., 08-22 and 08-29)
+
+          # ==== Tape (keep cost reasonable; quotes are the priority) ====
+          TAPE_TIERA_ONLY: "0"                 # include Tier-B tape
+          TAPE_B_TOPN: "16"                    # tape for top-16 Tier-B by chain OI
+          TAPE_INTERVAL: "5min"
+          FALLBACK_INTERVAL: "1min"
+          TAPE_FORCE_REFRESH: "0"
+
+          # ==== History (keep fast; Tier-A equities only) ====
+          HISTORY_TIERB: "0"
+          MAX_EARNINGS_QTRS: "28"
+          DAILY_LOOKBACK_YEARS: "8"
         shell: bash
         run: |
           echo "[relay] force_run=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.force_run == 'true' }}"
