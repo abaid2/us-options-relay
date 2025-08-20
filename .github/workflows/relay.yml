@@ -169,7 +169,15 @@ jobs:
           TIERB_EVENT_WINDOW_DAYS: "10"
           TIERB_PRIMARY_DELTA_MID: "0.35"
           TIERB_LOTTO_DELTA_MID: "0.18"
-          TIERB_MULTI_WEEKLY: "1"              # include neighbor weekly (e.g., 08-22 and 08-29)
+          TIERB_MULTI_WEEKLY: "1"   # include neighbor weekly (e.g., 08-22 and 08-29)
+
+          # Tier-C
+          TIERC_ENABLE: "1"
+          TIERC_AFFORD_CAP: "150"
+          TIERC_SPREAD_MAX: "0.12"
+          TIERC_SPOT_MIN: "5"
+          TIERC_SPOT_MAX: "100"
+          TIERC_MAX_EXPIRIES_PER_U: "1"
 
           # ==== Tape (keep cost reasonable; quotes are the priority) ====
           TAPE_TIERA_ONLY: "0"                 # include Tier-B tape
