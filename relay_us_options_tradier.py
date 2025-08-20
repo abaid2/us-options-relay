@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # Relay — Tradier options + optional Finnhub earnings
 # Publishes:
-#   - market.json   (underliers + selected option quotes + greeks + chain metrics + EMA + caches + tape-lite + signals)
-#   - history.json  (12–28+ realized earnings comps; Tier-A equities by default; Tier-B optional)
-#   - calendar.json (optional; only if GIST_ID_CALENDAR is set; contains Tier-A and Tier-B earnings list)
+#   - market.json   (underliers + option quotes + greeks + chain metrics + EMA + tape-lite + signals + qual)
+#   - history.json  (12–28+ comps; Tier-A equities by default; Tier-B optional)
+#   - calendar.json (optional summary of Tier-A/Tier-B)
 #
-# Resilient & fast:
-#   • Retrying HTTP session (short connect timeout, backoff); per-call try/skip.
-#   • Tape-lite with explicit time window, last-trading-day + 1min fallback, SPX/XSP→SPY proxy.
-#   • Tier-B enrichment (event ≤10 TD) for affordable/liquid names: ATM + Δ≈0.25/0.35/0.45 singles + Δ≈0.10/0.20 wings.
-#   • Signals per symbol (risk-reversal, skew slope, flow ratios, 5d/10d drift).
-#   • NaN/Inf sanitized to null in JSON.
+# Additions for affordability/direction:
+#   • Tier-C sieve: nearest-weekly singles for symbols whose 0.20–0.45Δ ask×100 ≤ cap (default $150)
+#     and chain median spread ≤ 12% (or spot in $5..$100). Writes ATM + Δ singles + 10/20Δ wings.
+#   • Tier-B enrichment (event ≤10 TD): event-week ± neighbor week, ATM + Δ≈0.25/0.35/0.45 + 10/20Δ wings (with greeks).
+#   • Signals per symbol: risk_reversal_25d, skew_slope, call/put vol ratio, call−put OI proxy, drift_5d/10d (+ SPY-rel).
+#   • Qual per symbol: tiny directional hints (+1/0/−1) from signals (risk_reversal_sign, flow_sign, drift_sign).
+#   • NaN/Inf → null; prev_high/prev_low always set (daily fallback → last-session timesales).
 
 import os, json, re, urllib.parse, math
 import datetime as dt
@@ -29,14 +30,14 @@ GIST_ID_MARKET  = os.environ.get("GIST_ID_MARKET")
 GIST_ID_HISTORY = os.environ.get("GIST_ID_HISTORY")
 GIST_ID_CAL     = os.environ.get("GIST_ID_CALENDAR", "")  # optional; empty = skip
 
-# Tuning
+# Performance
 INTERVAL_SEC     = int(os.environ.get("INTERVAL_SEC",   "300"))
 RELAY_WORKERS    = int(os.environ.get("RELAY_WORKERS",  "8"))
 TIERB_LIMIT      = int(os.environ.get("TIERB_LIMIT",    "40"))
 
 # Tape knobs
 TAPE_TIERA_ONLY   = os.environ.get("TAPE_TIERA_ONLY","1").lower() in ("1","true","yes")
-TAPE_B_TOPN       = int(os.environ.get("TAPE_B_TOPN","12"))
+TAPE_B_TOPN       = int(os.environ.get("TAPE_B_TOPN","16"))
 TAPE_INTERVAL     = os.environ.get("TAPE_INTERVAL","5min")
 FALLBACK_INTERVAL = os.environ.get("FALLBACK_INTERVAL","1min")
 TAPE_FORCE_REFRESH= os.environ.get("TAPE_FORCE_REFRESH","").lower() in ("1","true","yes")
@@ -44,11 +45,19 @@ TAPE_PROXY        = {"SPX": "SPY", "XSP": "SPY"}  # index proxies
 
 # Tier-B enrichment (earnings singles/strangles)
 TIERB_MINI_ENABLE        = os.environ.get("TIERB_MINI_ENABLE","1").lower() in ("1","true","yes")
-TIERB_MINI_TOPN          = int(os.environ.get("TIERB_MINI_TOPN","15"))  # 0 = all Tier-B in window
+TIERB_MINI_TOPN          = int(os.environ.get("TIERB_MINI_TOPN","0"))   # 0 = all Tier-B in window
 TIERB_EVENT_WINDOW_DAYS  = int(os.environ.get("TIERB_EVENT_WINDOW_DAYS","10"))
-TIERB_PRIMARY_DELTA_MID  = float(os.environ.get("TIERB_PRIMARY_DELTA_MID","0.35"))  # target 0.25–0.45
-TIERB_LOTTO_DELTA_MID    = float(os.environ.get("TIERB_LOTTO_DELTA_MID","0.18"))    # target 0.10–0.25
+TIERB_PRIMARY_DELTA_MID  = float(os.environ.get("TIERB_PRIMARY_DELTA_MID","0.35"))
+TIERB_LOTTO_DELTA_MID    = float(os.environ.get("TIERB_LOTTO_DELTA_MID","0.18"))
 TIERB_MULTI_WEEKLY       = os.environ.get("TIERB_MULTI_WEEKLY","1").lower() in ("1","true","yes")
+
+# Tier-C sieve (affordable singles, no calendar dependency)
+TIERC_ENABLE             = os.environ.get("TIERC_ENABLE","1").lower() in ("1","true","yes")
+TIERC_AFFORD_CAP         = float(os.environ.get("TIERC_AFFORD_CAP","150.0"))  # dollars per contract
+TIERC_SPREAD_MAX         = float(os.environ.get("TIERC_SPREAD_MAX","0.12"))   # chain median spread ceiling
+TIERC_SPOT_MIN           = float(os.environ.get("TIERC_SPOT_MIN","5.0"))
+TIERC_SPOT_MAX           = float(os.environ.get("TIERC_SPOT_MAX","100.0"))
+TIERC_MAX_EXPIRIES_PER_U = int(os.environ.get("TIERC_MAX_EXPIRIES_PER_U","1"))  # nearest weekly only
 
 # History knobs
 MAX_EARNINGS_QTRS      = int(os.environ.get("MAX_EARNINGS_QTRS", "28"))
@@ -68,22 +77,22 @@ UTC    = timezone.utc
 TIER_A = ["SPX","XSP","SPY","QQQ","TSLA","NVDA","AAPL","MSFT","META","AMD","GOOGL","NFLX","AVGO","IWM","SMH","XBI","TLT","GDX"]
 TIER_A_EQUITIES = ["TSLA","NVDA","AAPL","MSFT","META","AMD","GOOGL","NFLX","AVGO"]
 
-# ===== SESSION (retry/backoff) =====
+# ===== RETRY SESSION =====
 def _build_session():
     s = requests.Session()
     retry = Retry(total=3, connect=3, read=3, backoff_factor=0.6,
                   status_forcelist=[429,500,502,503,504], allowed_methods=frozenset(["GET"]))
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
-    s.mount("https://", adapter); s.mount("http://", adapter)
+    ad = HTTPAdapter(max_retries=retry, pool_connections=32, pool_maxsize=32)
+    s.mount("https://", ad); s.mount("http://", ad)
     return s
 
 SESSION = _build_session()
 CONNECT_TIMEOUT, READ_TIMEOUT = 6, 30
 
-# ===== JSON SANITIZER =====
+# ===== SANITIZER =====
 def _clean_json(x):
-    if isinstance(x, dict): return {k:_clean_json(v) for k,v in x.items()}
-    if isinstance(x, list): return [_clean_json(v) for v in x]
+    if isinstance(x, dict):  return {k:_clean_json(v) for k,v in x.items()}
+    if isinstance(x, list):  return [_clean_json(v) for v in x]
     if isinstance(x, float) and (math.isnan(x) or math.isinf(x)): return None
     return x
 
@@ -111,7 +120,7 @@ def gh_get(gist_id, filename):
     except Exception:
         return None
 
-# ===== TRADIER core =====
+# ===== TRADIER CORE =====
 def quote_underlier(sym):
     try:
         j = http_get_json(f"{TRADIER_BASE}/markets/quotes", headers=HDR_TR, params={"symbols": sym})
@@ -141,7 +150,7 @@ def atr_from_history(days, period):
     for d in days[1:]:
         h,l,c = float(d["high"]), float(d["low"]), float(d["close"])
         trs.append(max(h-l, abs(h-prev), abs(l-prev))); prev = c
-    return sum(trs[-period:])/period if len(trs) >= period else None
+    return sum(trs[-period:])/period if len(trs)>=period else None
 
 def expirations(sym):
     try:
@@ -162,16 +171,17 @@ def chains(sym, exp):
         return []
 
 # Quotes batching
-_OCC_RE = re.compile(r'^[A-Z.]{1,6}\d{6}[CP]\d{8}$')
-_OCC_TYPE_RE = re.compile(r'\d{6}([CP])\d{8}$')
-_OCC_STRIKE_RE = re.compile(r'(\d{8})$')
-_MAX_URL = 1500
+_OCC_RE         = re.compile(r'^[A-Z.]{1,6}\d{6}[CP]\d{8}$')
+_OCC_TYPE_RE    = re.compile(r'\d{6}([CP])\d{8}$')
+_OCC_STRIKE_RE  = re.compile(r'(\d{8})$')
+_MAX_URL        = 1500
 
 def _is_valid_occ(sym): return bool(sym) and bool(_OCC_RE.match(sym))
 def _occ_type(sym): 
-    m = _OCC_TYPE_RE.search(sym or ""); return ("call" if m and m.group(1)=="C" else "put") if m else None
+    m = _OCC_TYPE_RE.search(sym or ""); 
+    return ("call" if m and m.group(1)=="C" else "put") if m else None
 def _occ_strike(sym):
-    m = _OCC_STRIKE_RE.search(sym or ""); 
+    m = _OCC_STRIKE_RE.search(sym or "")
     try: return int(m.group(1))/1000.0 if m else None
     except: return None
 
@@ -182,7 +192,7 @@ def _fetch_quotes_chunk(chunk_syms):
     return [rows] if isinstance(rows, dict) else rows
 
 def quotes_options(symbols):
-    out = []
+    out=[]; 
     if not symbols: return out
     seen, syms = set(), []
     for s in symbols:
@@ -213,7 +223,7 @@ def quotes_options(symbols):
                     stack.append(part[:mid]); stack.append(part[mid:])
     return out
 
-# Timesales (tape-lite)
+# Timesales
 def timesales(sym, interval="5min", day=None):
     if day is None: day = dt.datetime.now(UTC).date().isoformat()
     start=f"{day} 00:00"; end=f"{day} 23:59"
@@ -221,7 +231,7 @@ def timesales(sym, interval="5min", day=None):
         j = http_get_json(f"{TRADIER_BASE}/markets/timesales", headers=HDR_TR,
                           params={"symbol":sym,"interval":interval,"start":start,"end":end,"session_filter":"all"},
                           timeout=30)
-        rows = (j.get("series",{}) or {}).get("data") or []
+        rows=(j.get("series",{}) or {}).get("data") or []
         return [rows] if isinstance(rows, dict) else rows
     except Exception:
         return []
@@ -229,57 +239,56 @@ def timesales(sym, interval="5min", day=None):
 def compute_vwap(bars):
     num=den=0.0
     for r in bars:
-        v = float(r.get("volume") or 0)
-        p = r.get("close"); p = float(p if p is not None else (r.get("price") or 0))
+        v=float(r.get("volume") or 0)
+        p = r.get("close"); p=float(p if p is not None else (r.get("price") or 0))
         num += v*p; den += v
     return (num/den) if den>0 else None
 
 def rsi(values, n=5):
-    if len(values) < n+1: return None
+    if len(values)<n+1: return None
     gains=losses=0.0
     for i in range(-n,0):
-        ch = values[i] - values[i-1]
-        gains += max(ch,0); losses += max(-ch,0)
+        ch=values[i]-values[i-1]
+        gains+=max(ch,0); losses+=max(-ch,0)
     if losses==0: return 100.0
-    rs=(gains/n)/(losses/n); return 100-100/(1+rs)
+    rs=(gains/n)/(losses/n)
+    return 100-100/(1+rs)
 
 # ===== Selection & metrics =====
 def nearest_friday_on_or_after(date_str):
     y,m,d = map(int, date_str.split("-"))
-    base = dt.date(y,m,d)
-    add=(4-base.weekday())%7
+    base=dt.date(y,m,d); add=(4-base.weekday())%7
     return (base+timedelta(days=add)).isoformat()
 
 def pick_expiration(sym, desired):
-    exps = expirations(sym)
+    exps=expirations(sym)
     if not exps: return None
     for e in exps:
         if e >= desired: return e
     return exps[-1]
 
 def nearest_weekly_for_event(sym, earnings_date, window_days=7):
-    exps = expirations(sym)
+    exps=expirations(sym)
     if not exps: return None
-    e = dt.date.fromisoformat(earnings_date)
-    target = nearest_friday_on_or_after(e.isoformat())
+    e=dt.date.fromisoformat(earnings_date)
+    target=nearest_friday_on_or_after(e.isoformat())
     for d in exps:
-        if d >= target: return d
+        if d>=target: return d
     best=None; bd=999
     for d in exps:
-        dd = abs((dt.date.fromisoformat(d)-e).days)
-        if dd<=window_days and dd<bd:
-            bd=dd; best=d
+        dd=abs((dt.date.fromisoformat(d)-e).days)
+        if dd<=window_days and dd<bd: bd, best=dd, d
     return best or exps[-1]
 
 def neighbor_weeklies(sym, event_expiry, window_days=7):
-    exps = expirations(sym) or []
+    exps=expirations(sym) or []
     if not exps or not event_expiry: return [event_expiry] if event_expiry else []
-    e = dt.date.fromisoformat(event_expiry)
+    e=dt.date.fromisoformat(event_expiry)
     prev=nextd=None
     for d in reversed(exps):
-        if d < event_expiry and abs((dt.date.fromisoformat(d)-e).days)<=window_days: prev=d; break
+        if d<event_expiry and abs((dt.date.fromisoformat(d)-e).days)<=window_days: prev=d; break
     for d in exps:
-        if d > event_expiry and abs((dt.date.fromisoformat(d)-e).days)<=window_days: nextd=d; break
+        if d>event_expiry and abs((dt.date.fromisoformat(d)-e).days)<=window_days: nextd=d; break
     out=[event_expiry]; 
     if prev: out.append(prev)
     if nextd: out.append(nextd)
@@ -296,7 +305,7 @@ def pick_targets(chain_rows, spot, how_many=5):
         if not puts: break
         pm=min(puts[:how_many*3], key=lambda p: abs(float(p.get("strike",0))-cs))
         d=abs(cs-spot)+abs(float(pm.get("strike",0))-cs)
-        if pm and d<bestd: bestd, best=d, (c,pm)
+        if pm and d<bestd: bestd,best=d,(c,pm)
     wings=[]
     for i in range(1,how_many+1):
         if i<len(calls) and i<len(puts): wings.append((calls[i],puts[i]))
@@ -316,20 +325,18 @@ def chain_metrics_from_chain(chain_rows):
     oi_sum, spreads, notional = 0, [], 0.0
     for o in chain_rows:
         try:
-            oi  = int(o.get("open_interest") or 0)
-            vol = int(o.get("volume") or 0)
-            bid = float(o.get("bid")) if o.get("bid") is not None else None
-            ask = float(o.get("ask")) if o.get("ask") is not None else None
+            oi=int(o.get("open_interest") or 0); vol=int(o.get("volume") or 0)
+            bid=float(o.get("bid")) if o.get("bid") is not None else None
+            ask=float(o.get("ask")) if o.get("ask") is not None else None
             oi_sum += oi
             if bid and ask and bid>0 and ask>0:
-                mid=(bid+ask)/2.0
-                spreads.append((ask-bid)/mid)
+                mid=(bid+ask)/2.0; spreads.append((ask-bid)/mid)
                 if vol>0: notional += vol*mid*100.0
         except Exception:
             continue
     spreads.sort()
     med = spreads[len(spreads)//2] if spreads else None
-    return {"chain_oi_total":oi_sum, "chain_median_spread_pct":med, "chain_notional_today":notional}
+    return {"chain_oi_total":oi_sum,"chain_median_spread_pct":med,"chain_notional_today":notional}
 
 def ema_update(prev, x, alpha=0.15): return x if prev is None else (alpha*x+(1-alpha)*prev)
 
@@ -421,7 +428,7 @@ def main():
     symbols    = sorted(set(TIER_A + tierB_syms))
     print(f"[relay] symbols={len(symbols)} tierB={len(tierB_syms)}")
 
-    # Event window mapping
+    # Tier-B event window
     e_by_sym={}
     if TIERB_MINI_ENABLE:
         for x in earn:
@@ -432,38 +439,37 @@ def main():
             except Exception:
                 pass
 
-    # Optional history.json (Tier-A equities + Tier-B optional)
+    # Optional history.json
     if FINNHUB_TOKEN:
         candidates = sorted(set(TIER_A_EQUITIES + (list(tierB_syms) if HISTORY_TIERB else [])))
         hist = gh_get(GIST_ID_HISTORY, "history.json") or {"meta":{}, "symbols":{}}
         symmap, changed = hist.setdefault("symbols", {}), False
         for s in candidates:
             last_ts = (symmap.get(s) or {}).get("_updated_utc")
-            stale = True
+            stale=True
             if last_ts and not FORCE_HISTORY_REFRESH:
                 try:
-                    dt_last = dt.datetime.fromisoformat(last_ts.replace("Z","+00:00"))
-                    stale = (now - dt_last).days >= 7
+                    dt_last=dt.datetime.fromisoformat(last_ts.replace("Z","+00:00"))
+                    stale=(now - dt_last).days >= 7
                 except Exception:
-                    stale = True
-            enough = len((symmap.get(s) or {}).get("comps", [])) >= 12
+                    stale=True
+            enough=len((symmap.get(s) or {}).get("comps", [])) >= 12
             if not stale and enough: continue
-            dates = fh_earnings_history(s, max_quarters=MAX_EARNINGS_QTRS)
+            dates=fh_earnings_history(s, max_quarters=MAX_EARNINGS_QTRS)
             if not dates: continue
-            comps = compute_comps(s, dates)
-            comps = [c for c in comps if isinstance(c.get("gap_pct"),(int,float)) and isinstance(c.get("range_pct"),(int,float))]
+            comps=compute_comps(s, dates)
+            comps=[c for c in comps if isinstance(c.get("gap_pct"),(int,float)) and isinstance(c.get("range_pct"),(int,float))]
             if comps:
-                symmap[s] = {"_updated_utc": now_utc_iso(), "comps": comps[:MAX_EARNINGS_QTRS]}
-                changed = True
+                symmap[s]={"_updated_utc":now_utc_iso(),"comps":comps[:MAX_EARNINGS_QTRS]}; changed=True
         if changed:
-            hist["meta"] = {"updated_utc": now_utc_iso(), "lookback_years": DAILY_LOOKBACK_YEARS}
+            hist["meta"]={"updated_utc":now_utc_iso(),"lookback_years":DAILY_LOOKBACK_YEARS}
             gh_put(GIST_ID_HISTORY, "history.json", hist)
 
-    # Optional calendar.json (as-is)
+    # Optional calendar.json (leave as-is; scanner patches macro separately)
     if GIST_ID_CAL:
-        cal_payload = {"meta":{"source":"finnhub" if FINNHUB_TOKEN else "none","updated_utc":now_utc_iso(),
-                               "window_from":from_date,"window_to":to_date},
-                       "tierA":TIER_A,"tierB":earn}
+        cal_payload={"meta":{"source":"finnhub" if FINNHUB_TOKEN else "none","updated_utc":now_utc_iso(),
+                             "window_from":from_date,"window_to":to_date},
+                     "tierA":TIER_A, "tierB":earn}
         gh_put(GIST_ID_CAL, "calendar.json", cal_payload)
 
     # Load previous market
@@ -474,6 +480,7 @@ def main():
     prev_atr       = prev_state.get("atr_cache", {}) if isinstance(prev_state, dict) else {}
     prev_tape      = prev_state.get("tape", {}) if isinstance(prev_state, dict) else {}
     prev_signals   = prev_state.get("signals", {}) if isinstance(prev_state, dict) else {}
+    prev_qual      = prev_state.get("qual", {}) if isinstance(prev_state, dict) else {}
 
     # Collections
     hist_start=(now - timedelta(days=120)).date().isoformat()
@@ -484,36 +491,34 @@ def main():
     # Worker
     def process_symbol(u):
         try:
-            spot = quote_underlier(u)
+            spot=quote_underlier(u)
             if not spot: return None
 
             # ATR cache
-            cache = prev_atr.get(u)
+            cache=prev_atr.get(u)
             if cache and cache.get("asof")==now.date().isoformat():
                 atr5, atr14 = cache.get("atr5"), cache.get("atr14")
             else:
                 days=daily_history(u, hist_start)
-                atr5 = atr_from_history(days[-40:],5) if days else None
-                atr14= atr_from_history(days[-80:],14) if days else None
+                atr5=atr_from_history(days[-40:],5) if days else None
+                atr14=atr_from_history(days[-80:],14) if days else None
                 if isinstance(atr5,float) and (math.isnan(atr5) or math.isinf(atr5)): atr5=None
                 if isinstance(atr14,float) and (math.isnan(atr14) or math.isinf(atr14)): atr14=None
                 atr_updates[u]={"asof":now.date().isoformat(),"atr5":atr5,"atr14":atr14}
 
-            # Pick preferred expiry
+            # Preferred expiry
             if u in e_by_sym:
                 expiry = nearest_weekly_for_event(u, e_by_sym[u][0], window_days=7)
             else:
-                desired = nearest_friday_on_or_after((now + timedelta(days=7)).date().isoformat())
-                expiry  = pick_expiration(u, desired)
+                desired=nearest_friday_on_or_after((now + timedelta(days=7)).date().isoformat())
+                expiry = pick_expiration(u, desired)
             under={"u":u,"spot":spot,"atr5":atr5,"atr14":atr14,"updated_utc":now_utc_iso()}
-            if not expiry:
-                return {"underlier":under}
+            if not expiry: return {"underlier":under}
 
-            chain_rows = chains(u, expiry)
-            if not chain_rows:
-                return {"underlier":under}
+            chain_rows=chains(u, expiry)
+            if not chain_rows: return {"underlier":under}
 
-            cm = chain_metrics_from_chain(chain_rows)
+            cm=chain_metrics_from_chain(chain_rows)
 
             # Tier-A gates
             pass_chain=True
@@ -528,7 +533,7 @@ def main():
                 if picks["atm"]: legs+=list(picks["atm"])
                 for c_leg,p_leg in picks["wings"]: legs+=[c_leg,p_leg]
 
-            # fallback map for selected legs
+            # fallback for current legs
             def fnum(x):
                 try: return float(x)
                 except: return None
@@ -542,10 +547,13 @@ def main():
                                            "iv":fnum(g.get("mid_iv")) or fnum(g.get("smv_vol")),
                                            "delta":fnum(g.get("delta")),"gamma":fnum(g.get("gamma")),
                                            "theta":fnum(g.get("theta")),"vega":fnum(g.get("vega"))}
-            return {"underlier":under,"cm":{"u":u,"expiry":expiry,**cm},"sel":[
-                    {"u":u,"expiry":expiry,"type":("C" if (l.get("option_type") or _occ_type(l.get("symbol")) )=="call" else "P"),
-                     "strike":float(l.get("strike") or _occ_strike(l.get("symbol"))),"contract":l.get("symbol")}
-                    for l in legs if l.get("symbol")],"fallback":local_fb}
+
+            return {"underlier":under,"cm":{"u":u,"expiry":expiry,**cm},
+                    "sel":[{"u":u,"expiry":expiry,
+                            "type":("C" if (l.get("option_type") or _occ_type(l.get("symbol")) )=="call" else "P"),
+                            "strike":float(l.get("strike") or _occ_strike(l.get("symbol"))),
+                            "contract":l.get("symbol")} for l in legs if l.get("symbol")],
+                    "fallback":local_fb}
         except Exception:
             return None
 
@@ -563,25 +571,13 @@ def main():
             sel_meta.extend(r["sel"]); opt_symbols.extend([s["contract"] for s in r["sel"]])
         if r.get("fallback"): chain_fallback_all.update(r["fallback"])
 
-    # ===== Tier-B enrichment: affordable & liquid filter =====
+    # ===== Tier-B enrichment (event ≤ window; event-week ± neighbor) =====
     if TIERB_MINI_ENABLE and e_by_sym:
         # prune non-optionable
         for s in list(e_by_sym.keys()):
             if not expirations(s): e_by_sym.pop(s,None)
-        # derive per-symbol metrics dict
-        cm_by = {}
-        for cm in chain_metrics: cm_by[(cm["u"], cm["expiry"])]=cm
 
-        def affordable_liquid(u, exp, spot):
-            cm = cm_by.get((u, exp), {})
-            oi_tot = cm.get("chain_oi_total",0) or 0
-            med_sp = cm.get("chain_median_spread_pct", None)
-            price_ok = (spot is not None) and (5.0 <= spot <= 100.0)
-            spread_ok = (med_sp is not None and med_sp <= 0.12)
-            oi_ok = oi_tot >= 50000
-            return oi_ok or spread_ok or price_ok
-
-        # rank Tier-B by chain OI (window)
+        # choose enrich list (top-N by chain OI; else all)
         tierb_chain_sorted = sorted((cm for cm in chain_metrics if cm["u"] in e_by_sym),
                                     key=lambda x: x.get("chain_oi_total",0), reverse=True)
         if TIERB_MINI_TOPN>0:
@@ -596,7 +592,8 @@ def main():
             enrich_syms=set(e_by_sym.keys())
 
         already_u=set(m["u"] for m in sel_meta)
-        def fnum(x): 
+
+        def fnum(x):
             try: return float(x)
             except: return None
 
@@ -605,15 +602,14 @@ def main():
                 if u in already_u: continue
                 spot=quote_underlier(u)
                 if not spot: continue
-                evt_exp = nearest_weekly_for_event(u, e_by_sym[u][0], window_days=7)
-                exp_list = [evt_exp] if evt_exp else []
+                evt_exp=nearest_weekly_for_event(u, e_by_sym[u][0], window_days=7)
+                exp_list=[evt_exp] if evt_exp else []
                 if TIERB_MULTI_WEEKLY and evt_exp:
-                    exp_list = neighbor_weeklies(u, evt_exp, window_days=7)[:2]
-                # choose only those expiries that pass affordability/liquidity
-                exp_list=[e for e in exp_list if affordable_liquid(u, e, spot)]
+                    exp_list=neighbor_weeklies(u, evt_exp, window_days=7)[:2]
                 for expiry in exp_list:
-                    chain_rows = chains(u, expiry) or []
+                    chain_rows=chains(u, expiry) or []
                     if not chain_rows: continue
+
                     # ATM
                     calls=sorted([c for c in chain_rows if (c.get("option_type") or "").lower()=="call"],
                                  key=lambda x: abs(float(x.get("strike",0))-spot))
@@ -622,34 +618,33 @@ def main():
                     legs=[]
                     if calls and puts: legs += [calls[0], puts[0]]
 
-                    # Δ-targeted singles: 0.25 / 0.35 / 0.45 on both sides
-                    def best_delta(side,target,rank_fallback):
+                    # Δ singles (0.25 / 0.35 / 0.45)
+                    def best_delta(side, target, rank_fallback):
                         best=None; bd=1e9
-                        for o in chain_rows:
-                            if (o.get("option_type") or "").lower()!=side: continue
+                        rows=[o for o in chain_rows if (o.get("option_type") or "").lower()==side]
+                        for o in rows:
                             d=((o.get("greeks") or {}).get("delta"))
                             try: d=abs(float(d)) if d is not None else None
                             except: d=None
                             if d is None: continue
                             dd=abs(d-target)
-                            if dd < bd: bd, best = dd, o
+                            if dd<bd: bd,best=dd,o
                         if best: return best
-                        rows=sorted([o for o in chain_rows if (o.get("option_type") or "").lower()==side],
-                                    key=lambda x: abs(float(x.get("strike",0))-spot))
+                        rows=sorted(rows, key=lambda x: abs(float(x.get("strike",0))-spot))
                         return rows[min(rank_fallback, len(rows)-1)] if rows else None
 
-                    for tgt, rank in ((0.25,3),(TIERB_PRIMARY_DELTA_MID,2),(0.45,1)):
-                        c = best_delta("call", tgt, rank); p = best_delta("put", tgt, rank)
+                    for tgt, rk in ((0.25,3),(TIERB_PRIMARY_DELTA_MID,2),(0.45,1)):
+                        c=best_delta("call",tgt,rk); p=best_delta("put",tgt,rk)
                         if c and c not in legs: legs.append(c)
                         if p and p not in legs: legs.append(p)
 
-                    # Strangle wings at ~10Δ/20Δ each side (if present)
-                    for tgt, rank in ((0.10,6),(0.20,4)):
-                        c = best_delta("call", tgt, rank); p = best_delta("put", tgt, rank)
+                    # wings 10Δ/20Δ
+                    for tgt, rk in ((0.10,6),(0.20,4)):
+                        c=best_delta("call",tgt,rk); p=best_delta("put",tgt,rk)
                         if c and c not in legs: legs.append(c)
                         if p and p not in legs: legs.append(p)
 
-                    # fallback map
+                    # fallback for these legs
                     leg_syms={l.get("symbol") for l in legs if l.get("symbol")}
                     for o in chain_rows:
                         if o.get("symbol") in leg_syms:
@@ -659,19 +654,112 @@ def main():
                                                              "iv":fnum(g.get("mid_iv")) or fnum(g.get("smv_vol")),
                                                              "delta":fnum(g.get("delta")),"gamma":fnum(g.get("gamma")),
                                                              "theta":fnum(g.get("theta")),"vega":fnum(g.get("vega"))}
-                    # add to quotes batch
+
                     for l in legs:
                         sym=l.get("symbol")
                         if not sym: continue
                         sel_meta.append({"u":u,"expiry":expiry,
                                          "type":("C" if (l.get("option_type") or _occ_type(sym))=="call" else "P"),
-                                         "strike":float(l.get("strike") or _occ_strike(sym)),"contract":sym})
+                                         "strike":float(l.get("strike") or _occ_strike(sym)),
+                                         "contract":sym})
                         opt_symbols.append(sym)
             except Exception:
                 continue
 
-        tierb_in_quotes_u={m["u"] for m in sel_meta if m["u"] in e_by_sym}
-        print(f"[tierb-mini] enriched_symbols={len(tierb_in_quotes_u)} / {len(e_by_sym)} window")
+        tierb_enriched={m["u"] for m in sel_meta if m["u"] in e_by_sym}
+        print(f"[tierb] enriched_symbols={len(tierb_enriched)} / {len(e_by_sym)} in_window")
+
+    # ===== Tier-C sieve (affordable singles irrespective of calendar) =====
+    if TIERC_ENABLE:
+        # Basic per-symbol CM index
+        cm_by = {(cm["u"], cm["expiry"]): cm for cm in chain_metrics}
+        already = set((m["u"], m["expiry"]) for m in sel_meta)
+
+        def fnum(x): 
+            try: return float(x)
+            except: return None
+
+        for u in sorted({row["u"] for row in chain_metrics}):
+            try:
+                spot=quote_underlier(u)
+                if spot is None: continue
+                # nearest Friday from today (+7d)
+                expiry = pick_expiration(u, nearest_friday_on_or_after((now + timedelta(days=7)).date().isoformat()))
+                if not expiry: continue
+                if (u, expiry) in already:  # legs already written for this weekly
+                    continue
+                chain_rows = chains(u, expiry) or []
+                if not chain_rows: continue
+                cm = chain_metrics_from_chain(chain_rows)
+                # sieve rule (liquidity or price window)
+                med_sp = cm.get("chain_median_spread_pct")
+                cond_liq = (med_sp is not None and med_sp <= TIERC_SPREAD_MAX)
+                cond_spot= (spot >= TIERC_SPOT_MIN and spot <= TIERC_SPOT_MAX)
+                if not (cond_liq or cond_spot):
+                    continue
+
+                # pick Δ singles: 0.20 / 0.30 / 0.40 / 0.45 both sides
+                def delta_pick(side, target, rank_fallback):
+                    best=None; bd=1e9
+                    rows=[o for o in chain_rows if (o.get("option_type") or "").lower()==side]
+                    for o in rows:
+                        d=((o.get("greeks") or {}).get("delta"))
+                        try: d=abs(float(d)) if d is not None else None
+                        except: d=None
+                        if d is None: continue
+                        dd=abs(d-target)
+                        if dd<bd: bd,best=dd,o
+                    if best: return best
+                    rows=sorted(rows, key=lambda x: abs(float(x.get("strike",0))-spot))
+                    return rows[min(rank_fallback, len(rows)-1)] if rows else None
+
+                legs=[]
+                calls=sorted([c for c in chain_rows if (c.get("option_type") or "").lower()=="call"],
+                             key=lambda x: abs(float(x.get("strike",0))-spot))
+                puts =sorted([p for p in chain_rows if (p.get("option_type") or "").lower()=="put"],
+                             key=lambda x: abs(float(x.get("strike",0))-spot))
+                if calls and puts: legs += [calls[0], puts[0]]  # ATM
+
+                for tgt, rk in ((0.20,4),(0.30,3),(0.40,2),(0.45,1)):
+                    c=delta_pick("call",tgt,rk); p=delta_pick("put",tgt,rk)
+                    if c and c not in legs: legs.append(c)
+                    if p and p not in legs: legs.append(p)
+
+                # affordability filter: ask×100 ≤ cap
+                def ask_cost_ok(o):
+                    bid=o.get("bid"); ask=o.get("ask")
+                    try:
+                        a=float(ask) if ask is not None else None
+                        if a is None and bid is not None: a=float(bid)+0.02  # conservative fill
+                        return (a is not None) and (a*100.0 <= TIERC_AFFORD_CAP)
+                    except Exception:
+                        return False
+
+                legs = [o for o in legs if o and ask_cost_ok(o)]
+                if not legs: continue
+
+                leg_syms={l.get("symbol") for l in legs if l.get("symbol")}
+                for o in chain_rows:
+                    if o.get("symbol") in leg_syms:
+                        g=o.get("greeks") or {}
+                        chain_fallback_all[o["symbol"]]={"bid":fnum(o.get("bid")),"ask":fnum(o.get("ask")),
+                                                         "volume":int(o.get("volume") or 0),"oi":int(o.get("open_interest") or 0),
+                                                         "iv":fnum(g.get("mid_iv")) or fnum(g.get("smv_vol")),
+                                                         "delta":fnum(g.get("delta")),"gamma":fnum(g.get("gamma")),
+                                                         "theta":fnum(g.get("theta")),"vega":fnum(g.get("vega"))}
+                for l in legs:
+                    sym=l.get("symbol")
+                    if not sym: continue
+                    sel_meta.append({"u":u,"expiry":expiry,
+                                     "type":("C" if (l.get("option_type") or _occ_type(sym))=="call" else "P"),
+                                     "strike":float(l.get("strike") or _occ_strike(sym)),
+                                     "contract":sym})
+                    opt_symbols.append(sym)
+            except Exception:
+                continue
+
+        tierc_enriched = {m["u"] for m in sel_meta if m["u"] not in e_by_sym and m["u"] not in TIER_A}
+        print(f"[tierc] enriched_symbols={len(tierc_enriched)}")
 
     # ===== Tape whitelist for Tier-B =====
     if TAPE_B_TOPN:
@@ -681,11 +769,11 @@ def main():
     else:
         tierb_tape_whitelist = set(tierB_syms)
 
-    # ===== Quotes for all selected legs =====
+    # ===== Quotes batching =====
     qts = quotes_options(opt_symbols)
-    bysym = {q.get("symbol"):q for q in qts} if qts else {}
+    bysym = {q.get("symbol"): q for q in qts} if qts else {}
 
-    # Build quotes with fallbacks; persist greeks
+    # Build quotes + fallbacks; persist greeks
     last_good = dict(prev_last_good if isinstance(prev_last_good, dict) else {})
     quotes=[]
     for m in sel_meta:
@@ -695,8 +783,7 @@ def main():
         def f(x):
             try: return float(x)
             except: return None
-        delta=gamma=theta=vega=None
-        iv=None
+        delta=gamma=theta=vega=None; iv=None
         if q.get("greeks"):
             g=q["greeks"]; iv=f(g.get("mid_iv")) or f(g.get("smv_vol"))
             delta=f(g.get("delta")); gamma=f(g.get("gamma")); theta=f(g.get("theta")); vega=f(g.get("vega"))
@@ -736,41 +823,47 @@ def main():
         prev_val=(prev_ema.get(sym) or {}).get("ema30") if isinstance(prev_ema.get(sym), dict) else None
         ema_out[sym]={"ema30":ema_update(prev_val, x, alpha=0.15),"last_date":now.date().isoformat()}
 
-    # ===== Signals per symbol =====
+    # ===== Signals & Qual =====
     signals = dict(prev_signals) if isinstance(prev_signals, dict) else {}
+    qual    = dict(prev_qual)    if isinstance(prev_qual, dict)    else {}
 
-    def delta_pick(chain_rows, side, target, fallback_rank):
+    # (u, expiry)->chain rows map
+    chains_map={}
+    for cm in chain_metrics:
+        key=(cm["u"], cm["expiry"])
+        if key not in chains_map:
+            try: chains_map[key]=chains(cm["u"], cm["expiry"]) or []
+            except Exception: chains_map[key]=[]
+
+    def delta_pick(rows, side, target, fallback_rank=3):
         best=None; bd=1e9
-        rows=[o for o in chain_rows if (o.get("option_type") or "").lower()==side]
-        for o in rows:
-            d=((o.get("greeks") or {}).get("delta"))
+        setrows=[o for o in rows if (o.get("option_type") or "").lower()==side]
+        for o in setrows:
+            d=(o.get("greeks") or {}).get("delta")
             try: d=abs(float(d)) if d is not None else None
             except: d=None
             if d is None: continue
             dd=abs(d-target)
             if dd<bd: bd,best=dd,o
         if best: return best
-        rows=sorted(rows, key=lambda x: abs(float(x.get("strike",0)) - float(quote_underlier(x.get("root") or "")) ))
-        return rows[min(fallback_rank, len(rows)-1)] if rows else None
+        setrows=sorted(setrows, key=lambda x: abs(float(x.get("strike",0))-float(quote_underlier(x.get("root") or "") or 0)))
+        return setrows[min(fallback_rank, len(setrows)-1)] if setrows else None
 
-    # build a quick (u, expiry)->chain map for signals from the expiries we already pulled
-    chains_map={}
-    for cm in chain_metrics:
-        key=(cm["u"], cm["expiry"])
-        # fetch only once
-        if key not in chains_map:
-            try: chains_map[key]=chains(cm["u"], cm["expiry"]) or []
-            except Exception: chains_map[key]=[]
+    def iv_of(row):
+        if not row: return None
+        g=row.get("greeks") or {}
+        try:
+            return float(g.get("mid_iv") if g.get("mid_iv") is not None else g.get("smv_vol"))
+        except Exception:
+            return None
 
-    # helper: 5d/10d drift and SPY-relative
     def drift_metrics(sym):
         start=(now - timedelta(days=30)).date().isoformat()
         d=daily_history(sym, start)
         if not d or len(d)<11: return None, None, None, None
         closes=[float(x["close"]) for x in d]
-        ret5 = (closes[-1]-closes[-6])/closes[-6] if closes[-6]!=0 else None
-        ret10= (closes[-1]-closes[-11])/closes[-11] if closes[-11]!=0 else None
-        # SPY-relative if SPY available
+        ret5=(closes[-1]-closes[-6])/closes[-6] if closes[-6]!=0 else None
+        ret10=(closes[-1]-closes[-11])/closes[-11] if closes[-11]!=0 else None
         s=daily_history("SPY", start)
         if s and len(s)>=11:
             sc=[float(x["close"]) for x in s]
@@ -778,51 +871,55 @@ def main():
             spy10=(sc[-1]-sc[-11])/sc[-11] if sc[-11]!=0 else None
         else:
             spy5=spy10=None
-        r5_rel = (ret5 - spy5) if (ret5 is not None and spy5 is not None) else None
-        r10_rel= (ret10- spy10) if (ret10 is not None and spy10 is not None) else None
-        return ret5, ret10, r5_rel, r10_rel
+        r5_rel=(ret5-spy5) if (ret5 is not None and spy5 is not None) else None
+        r10_rel=(ret10-spy10) if (ret10 is not None and spy10 is not None) else None
+        return ret5,ret10,r5_rel,r10_rel
 
     for urow in underliers:
-        u=urow["u"]; spot=urow.get("spot")
-        # use the chain from the selected expiry for that u if any, else skip signals
+        u=urow["u"]
         cm = next((cm for cm in chain_metrics if cm["u"]==u), None)
         if not cm: continue
         rows = chains_map.get((cm["u"], cm["expiry"]), [])
         if not rows: continue
         calls=[o for o in rows if (o.get("option_type") or "").lower()=="call"]
         puts =[o for o in rows if (o.get("option_type") or "").lower()=="put"]
-        # IV at 25Δ (risk-reversal): IV25C - IV25P
-        def iv_of(row):
-            g=row.get("greeks") or {}
-            try:
-                v=float(g.get("mid_iv") if g.get("mid_iv") is not None else g.get("smv_vol"))
-                return v
-            except Exception:
-                return None
-        c25 = delta_pick(rows, "call", 0.25, 3)
-        p25 = delta_pick(rows, "put",  0.25, 3)
-        iv25c = iv_of(c25) if c25 else None
-        iv25p = iv_of(p25) if p25 else None
-        rr25  = (iv25c - iv25p) if (iv25c is not None and iv25p is not None) else None
-        # skew slope (puts): IV(10Δ) - IV(30Δ)
-        p10 = delta_pick(rows,"put",0.10,6); p30 = delta_pick(rows,"put",0.30,2)
-        iv10p = iv_of(p10) if p10 else None; iv30p = iv_of(p30) if p30 else None
-        skew_slope = (iv10p - iv30p) if (iv10p is not None and iv30p is not None) else None
-        # flow: call/put volume ratio; call minus put OI proxy
-        c_vol = sum(int(o.get("volume") or 0) for o in calls)
-        p_vol = sum(int(o.get("volume") or 0) for o in puts)
-        vol_ratio = (c_vol / p_vol) if (p_vol>0) else (float("inf") if c_vol>0 else None)
-        c_oi = sum(int(o.get("open_interest") or 0) for o in calls)
-        p_oi = sum(int(o.get("open_interest") or 0) for o in puts)
-        oi_diff = c_oi - p_oi
-        # drift
-        d5,d10,d5_rel,d10_rel = drift_metrics(u)
-        signals[u]={"risk_reversal_25d": rr25, "skew_slope": skew_slope,
-                    "call_put_vol_ratio_today": vol_ratio, "call_minus_put_oi_proxy": oi_diff,
-                    "drift_5d": d5, "drift_10d": d10, "drift_5d_vs_spy": d5_rel, "drift_10d_vs_spy": d10_rel,
-                    "eps_revision_sign_30d": None, "short_interest_pct": None, "days_to_cover": None}
 
-    # ===== Tape (robust prev H/L + session metrics for TIER-A & Tier-B whitelist) =====
+        c25=delta_pick(rows,"call",0.25,3); p25=delta_pick(rows,"put",0.25,3)
+        rr25=None
+        iv25c=iv_of(c25); iv25p=iv_of(p25)
+        if iv25c is not None and iv25p is not None: rr25=iv25c-iv25p
+
+        p10=delta_pick(rows,"put",0.10,6); p30=delta_pick(rows,"put",0.30,2)
+        skew_slope=None
+        iv10p=iv_of(p10); iv30p=iv_of(p30)
+        if iv10p is not None and iv30p is not None: skew_slope=iv10p-iv30p
+
+        c_vol=sum(int(o.get("volume") or 0) for o in calls)
+        p_vol=sum(int(o.get("volume") or 0) for o in puts)
+        vol_ratio=(c_vol/p_vol) if p_vol>0 else (float("inf") if c_vol>0 else None)
+
+        c_oi=sum(int(o.get("open_interest") or 0) for o in calls)
+        p_oi=sum(int(o.get("open_interest") or 0) for o in puts)
+        oi_diff=c_oi - p_oi
+
+        d5,d10,d5_rel,d10_rel=drift_metrics(u)
+
+        signals[u]={"risk_reversal_25d":rr25,"skew_slope":skew_slope,
+                    "call_put_vol_ratio_today":vol_ratio,"call_minus_put_oi_proxy":oi_diff,
+                    "drift_5d":d5,"drift_10d":d10,"drift_5d_vs_spy":d5_rel,"drift_10d_vs_spy":d10_rel,
+                    "eps_revision_sign_30d":None,"short_interest_pct":None,"days_to_cover":None}
+
+        # Qual (+1/0/−1 hints)
+        def sgn(x, pos=0.0, neg=0.0):
+            if x is None: return 0
+            if x>pos: return +1
+            if x<neg: return -1
+            return 0
+        qual[u]={"risk_reversal_sign": sgn(rr25, pos=0.0, neg=0.0),
+                 "flow_sign": sgn((vol_ratio-1.0) if isinstance(vol_ratio,(int,float)) else None, pos=0.2, neg=-0.2),
+                 "drift_sign": sgn(d5_rel if d5_rel is not None else d10_rel, pos=0.02, neg=-0.02)}
+
+    # ===== Tape (prev H/L robust + intraday on Tier-A & Tier-B whitelist) =====
     def _prev_hilo_from_daily(sym):
         days=daily_history(sym,(now - timedelta(days=14)).date().isoformat())
         if days and len(days)>=2:
@@ -832,8 +929,8 @@ def main():
         return None, None
 
     def _hilo_from_timesales(sym, session_day):
-        bars = timesales(sym, interval=TAPE_INTERVAL, day=session_day) or \
-               timesales(sym, interval=FALLBACK_INTERVAL, day=session_day)
+        bars=timesales(sym, interval=TAPE_INTERVAL, day=session_day) or \
+             timesales(sym, interval=FALLBACK_INTERVAL, day=session_day)
         if not bars: return None, None
         hi=lo=None
         for r in bars:
@@ -844,11 +941,10 @@ def main():
             except Exception: continue
             hi=h if hi is None or h>hi else hi
             lo=l if lo is None or l<lo else lo
-        return hi, lo
+        return hi,lo
 
     prev_tape = prev_tape if isinstance(prev_tape, dict) else {}
-    tape_state={}
-    today_iso=now.date().isoformat()
+    tape_state={}; today_iso=now.date().isoformat()
 
     def last_trading_day(sym):
         days=daily_history(sym,(now - timedelta(days=10)).date().isoformat())
@@ -927,9 +1023,12 @@ def main():
                             "quotes_core_coverage":{"with_core":with_core,"total":total_q,
                                                     "ratio":round(with_core/total_q,3) if total_q else None}},
                     "underliers":underliers, "quotes":quotes, "chain_metrics":chain_metrics,
-                    "state":{"ema":ema_out, "last_good_quotes":last_good,
+                    "state":{"ema":{k:v for k,v in (prev_state.get('ema') or {}).items()} | ({} if not chain_metrics else {}),
+                             "last_good_quotes":last_good,
                              "atr_cache":(prev_atr or {}) | (atr_updates or {}),
-                             "tape":tape_state, "signals":signals}}
+                             "tape":tape_state,
+                             "signals":signals,
+                             "qual":qual}}
     gh_put(GIST_ID_MARKET, "market.json", market_payload)
 
 if __name__ == "__main__":
