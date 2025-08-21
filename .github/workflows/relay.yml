@@ -178,6 +178,10 @@ jobs:
           TIERC_SPOT_MIN: "5"
           TIERC_SPOT_MAX: "100"
           TIERC_MAX_EXPIRIES_PER_U: "1"
+          TIERC_CHAIN_OI_MIN: "25000"
+          
+          # Optional curated HV list to seed supply:
+          HV_LIST: "AFRM,UPST,RIOT,MARA,COIN,HOOD,PLTR,RBLX,IONQ,AI,SOFI,SNAP,NIO,LI,XPEV,BIDU,BABA,DKNG,TOST,U,PATH,RUN,ENPH,UVXY,SOXL,TQQQ"
 
           # ==== Tape (keep cost reasonable; quotes are the priority) ====
           TAPE_TIERA_ONLY: "0"                 # include Tier-B tape
